@@ -1,0 +1,280 @@
+//! Size and quality prediction from analysis histograms.
+//!
+//! Fitted by tools/fit_model.py against real encodes made with the same
+//! x264 build and settings the app uses (see crates/lab). Rate is a
+//! rho-domain style model: bits are linear in the number of coefficients
+//! that survive quantization and in their log-levels, evaluated at the
+//! H.264 quantizer step implied by the CRF, after the prefilter rung's
+//! per-frequency gain.
+
+use crate::analysis::{FrameStats, HIST_LEN, NBINS, NPOS, bin_mag};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct RateParams {
+    pub a_i: f64,
+    pub b_i: f64,
+    pub c_i: f64,
+    pub a_p: f64,
+    pub b_p: f64,
+    pub c_p: f64,
+    pub d_i: f64,
+    pub d_p: f64,
+    pub tau: f64,
+    pub tau_hf: f64,
+    pub mv_p: f64,
+}
+
+/// Quantization distortion: exp(ln_a) * Qstep(crf)^b * V^g, with V the
+/// residual coefficient energy per pixel after the rung's gain.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct DistParams {
+    pub ln_a: f64,
+    pub b: f64,
+    pub g: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Model {
+    pub rate: RateParams,
+    pub dist: DistParams,
+}
+
+/// Default x264 preset. The model is fitted per preset; the encoder must
+/// use exactly `x264_opts(preset)` for the predictions to hold.
+pub const X264_PRESET: &str = "medium";
+
+/// Options applied after the preset (rate control is added separately).
+/// rc-lookahead is capped at 20: each worker holds its own encoder, and
+/// medium's default of 40 costs ~400 MB per encoder at 1080p.
+pub fn x264_opts(preset: &str) -> String {
+    let base = "keyint=300:min-keyint=30:aq-mode=3";
+    match preset {
+        "ultrafast" | "superfast" | "veryfast" | "faster" => base.to_string(),
+        _ => format!("{base}:rc-lookahead=20"),
+    }
+}
+
+// FITTED by tools/fit_model.py on the lab data (4 game clips x 360p..1080p,
+// 30/60 fps, 8 CRFs x 4 rungs, true PSNR from decoded output); see MODEL.md.
+pub const MEDIUM: Model = Model {
+    rate: RateParams {
+        a_i: 8.5279, b_i: 5.2786, c_i: 0.2436, a_p: 3.9171, b_p: 0.0471, c_p: 0.7964,
+        d_i: -4.1704, d_p: 1.9340, tau: 0.6879, tau_hf: 1.9390, mv_p: 3.9643,
+    },
+    dist: DistParams { ln_a: -3.6053, b: 1.2271, g: 0.8583 },
+};
+
+pub const VERYFAST: Model = Model {
+    rate: RateParams {
+        a_i: 7.3940, b_i: 4.4007, c_i: 0.4093, a_p: 3.6618, b_p: 0.3717, c_p: 0.5912,
+        d_i: -3.5310, d_p: 1.9321, tau: 0.7236, tau_hf: 1.9444, mv_p: 2.9655,
+    },
+    dist: DistParams { ln_a: -2.9743, b: 1.2455, g: 0.7438 },
+};
+
+pub fn model_for(preset: &str) -> &'static Model {
+    match preset {
+        "veryfast" => &VERYFAST,
+        _ => &MEDIUM,
+    }
+}
+
+#[inline]
+pub fn qstep(q: f64) -> f64 {
+    0.625 * 2f64.powf(q / 6.0)
+}
+
+/// Analysis aggregated over one chunk: its first frame coded as I, the
+/// sampled remaining frames as P.
+#[derive(Clone, Debug, Default)]
+pub struct ChunkStats {
+    pub i_hist: Vec<u32>,
+    pub p_hist: Vec<u32>,
+    /// Frames that went into p_hist.
+    pub p_sampled: u32,
+    /// Frames in the chunk.
+    pub frames: u32,
+    pub src_energy: Vec<f64>,
+    /// Frames that went into src_energy.
+    pub src_frames: u32,
+    pub mbs_per_frame: f64,
+    pub pixels_per_frame: f64,
+    /// MV cost summed over the sampled P frames.
+    pub mv_cost: f64,
+}
+
+impl ChunkStats {
+    /// `first` is the analysis of the chunk's first frame (its intra
+    /// histogram is used); `rest` are sampled frames after it.
+    pub fn build(frames: u32, first: &FrameStats, rest: &[&FrameStats]) -> ChunkStats {
+        let mut s = ChunkStats {
+            i_hist: first.intra.clone(),
+            p_hist: vec![0; HIST_LEN],
+            p_sampled: 0,
+            frames,
+            src_energy: first.src_energy.clone(),
+            src_frames: 1,
+            mbs_per_frame: first.mbs as f64,
+            pixels_per_frame: first.pixels as f64,
+            mv_cost: 0.0,
+        };
+        for r in rest {
+            for (a, b) in s.p_hist.iter_mut().zip(&r.inter) {
+                *a += b;
+            }
+            for (a, b) in s.src_energy.iter_mut().zip(&r.src_energy) {
+                *a += b;
+            }
+            s.src_frames += 1;
+            s.p_sampled += 1;
+            s.mv_cost += r.mv_cost;
+        }
+        if rest.is_empty() {
+            // Single-frame chunk or nothing sampled: treat the I frame's
+            // intra residual as a pessimistic P estimate.
+            s.p_hist = first.intra.clone();
+            s.p_sampled = 1;
+        }
+        s
+    }
+
+    fn p_frames(&self) -> f64 {
+        (self.frames.saturating_sub(1)) as f64
+    }
+}
+
+/// Per-coefficient-position gain of a prefilter rung (1.0 = untouched),
+/// plus a correction for the spectral estimate of the detail it removes.
+#[derive(Clone, Debug)]
+pub struct Gain(pub [f64; NPOS], pub f64);
+
+/// The spectral estimate of prefilter loss is exact for a 0.5x rung (its
+/// cut-off sits on a DCT basis frequency) but low by ~16-19% for 0.6x and
+/// 0.75x (measured against the real round trip in the lab).
+fn scale_fix(factor: f64) -> f64 {
+    const PTS: [(f64, f64); 4] = [(0.5, 1.0), (0.6, 1.16), (0.75, 1.19), (1.0, 1.0)];
+    if factor <= PTS[0].0 {
+        return PTS[0].1;
+    }
+    for w in PTS.windows(2) {
+        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+        if factor <= x1 {
+            return y0 + (y1 - y0) * (factor - x0) / (x1 - x0);
+        }
+    }
+    1.0
+}
+
+impl Gain {
+    pub fn identity() -> Gain {
+        Gain([1.0; NPOS], 1.0)
+    }
+
+    /// Separable gain from the measured 1-D round-trip responses of the
+    /// rung's scaler for each DCT basis frequency (u / 16 cycles per pixel).
+    pub fn for_rung(w: usize, h: usize, rw: usize, rh: usize) -> Gain {
+        let gx: Vec<f64> = (0..8).map(|u| if u == 0 { 1.0 } else { crate::yuv::roundtrip_gain(w, rw, u as f64 / 16.0) }).collect();
+        let gy: Vec<f64> = (0..8).map(|v| if v == 0 { 1.0 } else { crate::yuv::roundtrip_gain(h, rh, v as f64 / 16.0) }).collect();
+        let mut g = [0.0; NPOS];
+        for v in 0..8 {
+            for u in 0..8 {
+                g[v * 8 + u] = gx[u] * gy[v];
+            }
+        }
+        Gain(g, scale_fix(rw as f64 / w as f64))
+    }
+}
+
+fn freq(k: usize) -> f64 {
+    ((k % 8) + (k / 8)) as f64 / 14.0
+}
+
+/// (nonzero count, sum of log2 levels) for a histogram at quantizer q.
+fn features(hist: &[u32], gain: &Gain, q: f64, p: &RateParams) -> (f64, f64) {
+    let inv_step = 1.0 / qstep(q);
+    let (mut nz, mut lv) = (0.0, 0.0);
+    for k in 0..NPOS {
+        let t = p.tau * (1.0 + p.tau_hf * freq(k));
+        let g = gain.0[k] * inv_step;
+        let row = &hist[k * NBINS..(k + 1) * NBINS];
+        for (i, &n) in row.iter().enumerate().rev() {
+            if n == 0 {
+                continue;
+            }
+            let x = bin_mag(i) * g;
+            if x < t {
+                break; // bins are sorted by magnitude
+            }
+            nz += n as f64;
+            lv += n as f64 * (x / t).log2();
+        }
+    }
+    (nz, lv)
+}
+
+/// Predicted encoded size of a chunk, in bytes.
+pub fn predict_bytes(m: &Model, c: &ChunkStats, gain: &Gain, crf: f64) -> f64 {
+    let p = &m.rate;
+    let (nz_i, lv_i) = features(&c.i_hist, gain, crf + p.d_i, p);
+    let (nz_p, lv_p) = features(&c.p_hist, gain, crf + p.d_p, p);
+    let scale = c.p_frames() / c.p_sampled.max(1) as f64;
+    let mv = p.mv_p * c.mv_cost * scale * qstep(30.0) / qstep(crf);
+    let bits = p.a_i * nz_i + p.b_i * lv_i + p.c_i * c.mbs_per_frame
+        + scale * (p.a_p * nz_p + p.b_p * lv_p)
+        + p.c_p * c.mbs_per_frame * c.p_frames()
+        + mv;
+    (bits / 8.0).max(64.0)
+}
+
+/// Detail removed by the rung alone (luma MSE per pixel).
+pub fn scale_mse(c: &ChunkStats, gain: &Gain) -> f64 {
+    let mut e = 0.0;
+    for k in 0..NPOS {
+        e += c.src_energy[k] * (1.0 - gain.0[k]).powi(2);
+    }
+    gain.1 * e / (c.src_frames.max(1) as f64 * c.pixels_per_frame)
+}
+
+/// Residual coefficient energy per pixel after the rung's gain.
+pub fn residual_energy(c: &ChunkStats, gain: &Gain) -> f64 {
+    let mut e = 0.0;
+    for k in 0..NPOS {
+        let g2 = gain.0[k] * gain.0[k];
+        for i in 0..NBINS {
+            let n = c.p_hist[k * NBINS + i];
+            if n != 0 {
+                let m = bin_mag(i);
+                e += n as f64 * m * m * g2;
+            }
+        }
+    }
+    e / (c.p_sampled.max(1) as f64 * c.pixels_per_frame)
+}
+
+/// Predicted luma MSE of the encode against the unfiltered source.
+pub fn predict_mse(m: &Model, c: &ChunkStats, gain: &Gain, crf: f64) -> f64 {
+    predict_mse_with(m, scale_mse(c, gain), residual_energy(c, gain), crf)
+}
+
+/// `predict_mse` with the CRF-independent parts precomputed.
+pub fn predict_mse_with(m: &Model, scale: f64, residual: f64, crf: f64) -> f64 {
+    let d = &m.dist;
+    scale + d.ln_a.exp() * qstep(crf).powf(d.b) * residual.max(1e-6).powf(d.g)
+}
+
+/// VMAF (vmaf_v0.6.1neg, the model smallifier.py used) predicted from luma
+/// PSNR: a logistic fitted by tools/vmaf_map.py to 2,400 two-second windows
+/// of game footage (4 clips x 4 rungs x 5 CRFs; rmse ~11 VMAF, so only a
+/// rough guide per window). Its shape is what matters for allocation: it
+/// saturates for clean scenes and collapses for starved ones, so the planner
+/// protects hard scenes instead of trading them for easy ones. (A variant
+/// with a rung term fitted at equal PSNR made real-VMAF results worse; the
+/// planner compares rungs at equal bytes, which that fit doesn't see.)
+pub fn vmaf_proxy(psnr: f64) -> f64 {
+    96.0 / (1.0 + (-(psnr - 26.883) / 3.798).exp())
+}
+
+pub fn psnr(mse: f64) -> f64 {
+    10.0 * (255.0f64 * 255.0 / mse.max(1e-6)).log10()
+}

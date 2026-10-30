@@ -1,0 +1,7 @@
+/target
+/.venv
+/testdata
+/third_party
+/web/smallifier.wasm
+/_site
+__pycache__/

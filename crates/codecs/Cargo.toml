@@ -1,0 +1,10 @@
+[package]
+name = "codecs"
+description = "x264 and libopus compiled from vendored sources, with small safe wrappers"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+links = "x264"
+
+[build-dependencies]
+cc = "1"

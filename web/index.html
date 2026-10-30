@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smallifier — shrink a clip to a target size, in your browser</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Smallifier</h1>
+  <p class="tagline">Shrinks a video clip to fit a size limit while keeping action and on-screen text as clear as the budget allows.
+  Everything runs on your device; the video is never uploaded.</p>
+</header>
+
+<main>
+  <section id="pick" class="card">
+    <label id="drop" for="file">
+      <input type="file" id="file" accept="video/*,.mkv,.mov,.webm,.mp4,.m4v">
+      <span><strong>Choose a video</strong> or drop it here</span>
+      <small>MP4, MOV, MKV or WebM — H.264, HEVC, VP8, VP9 or AV1 (whatever your browser can decode)</small>
+    </label>
+    <div id="info" hidden></div>
+  </section>
+
+  <section id="settings" class="card" hidden>
+    <h2>Settings</h2>
+    <div class="grid">
+      <label>Target size
+        <span class="row">
+          <input type="number" id="target" value="10" min="0.1" step="0.1">
+          <select id="unit">
+            <option value="1000000" selected>MB</option>
+            <option value="1048576">MiB</option>
+          </select>
+        </span>
+        <small>The output will not exceed this. 1 MB = 1,000,000 bytes (what most upload limits mean); MiB = 1,048,576.</small>
+      </label>
+      <label>Maximum resolution
+        <select id="maxres">
+          <option value="auto" selected>Auto (up to 1080p)</option>
+          <option value="1080">1080p</option>
+          <option value="720">720p</option>
+          <option value="540">540p</option>
+          <option value="360">360p</option>
+        </select>
+      </label>
+      <label>Frame rate
+        <select id="fps">
+          <option value="30" selected>Up to 30 fps</option>
+          <option value="60">Keep source (up to 60 fps)</option>
+        </select>
+        <small>At small sizes, 30 fps leaves more bits for detail.</small>
+      </label>
+      <label>Audio
+        <select id="audio">
+          <option value="auto" selected>Auto (Opus, ~5% of the size)</option>
+          <option value="32000">32 kbps</option>
+          <option value="48000">48 kbps</option>
+          <option value="64000">64 kbps</option>
+          <option value="96000">96 kbps</option>
+          <option value="128000">128 kbps</option>
+          <option value="0">No audio</option>
+        </select>
+      </label>
+      <label>Encoder speed
+        <select id="preset">
+          <option value="medium" selected>Balanced (x264 medium)</option>
+          <option value="veryfast">Fast (x264 veryfast)</option>
+        </select>
+        <small>Fast is about 3× quicker and a little softer.</small>
+      </label>
+      <label>Parallel workers
+        <select id="workers"></select>
+        <small>Each worker needs roughly 150–350 MB of memory.</small>
+      </label>
+    </div>
+    <button id="go" type="button">Smallify</button>
+  </section>
+
+  <section id="progress" class="card" hidden>
+    <h2>Working…</h2>
+    <ol id="phases"></ol>
+    <div class="bar"><div id="bar"></div></div>
+    <p id="status"></p>
+    <button id="cancel" type="button" class="secondary">Cancel</button>
+  </section>
+
+  <section id="result" class="card" hidden>
+    <h2>Done</h2>
+    <video id="preview" controls playsinline></video>
+    <p><a id="download" class="button" download>Download</a></p>
+    <table id="summary"></table>
+    <details>
+      <summary>Per-scene plan</summary>
+      <table id="scenes"></table>
+    </details>
+  </section>
+
+  <section id="error" class="card error" hidden></section>
+
+  <details id="log-box" class="card">
+    <summary>Log</summary>
+    <pre id="log"></pre>
+  </details>
+</main>
+
+<footer>
+  <p>How it works: one cheap analysis pass predicts, for every scene, how large and how good the encode would be at each
+  resolution and quality setting. The budget is spent where it buys the most quality, then each chunk is encoded once
+  with two-pass x264 to land on its share. Output is H.264 + Opus in MP4, which plays almost everywhere.</p>
+  <p>x264 (GPL) and libopus are compiled to WebAssembly; decoding uses your browser's WebCodecs.</p>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

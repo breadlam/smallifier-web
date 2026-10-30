@@ -1,0 +1,8 @@
+[target.wasm32-wasip1]
+# x264 keeps large arrays on the stack; wasm has no guard page, so an
+# overflow silently corrupts memory instead of crashing. 8 MiB, as natively.
+rustflags = ["-C", "target-feature=+simd128", "-C", "link-arg=-zstack-size=8388608"]
+
+[env]
+# tools/fetch-deps.sh puts (or symlinks) an extracted wasi-sdk release here.
+WASI_SDK_PATH = { value = "third_party/wasi-sdk", relative = true, force = false }

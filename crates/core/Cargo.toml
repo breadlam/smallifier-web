@@ -1,0 +1,9 @@
+[package]
+name = "smallifier-core"
+description = "Demux, analysis, size/quality model, planner and MP4 muxing (no I/O, no codecs)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
