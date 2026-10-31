@@ -6,5 +6,9 @@ license.workspace = true
 version.workspace = true
 links = "x264"
 
+[features]
+# SVT-AV1 (needs threads: native, or the wasm32-wasip1-threads target).
+av1 = []
+
 [build-dependencies]
-cc = "1"
+cc = { version = "1", features = ["parallel"] }

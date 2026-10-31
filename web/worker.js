@@ -260,33 +260,58 @@ async function runPass(job, rc, firstPass) {
   const hl = new DataView(r.buffer).getUint32(0, true);
   const head = JSON.parse(td.decode(r.subarray(4, 4 + hl)));
   head.scale_mse = scaleN ? scaleMse / scaleN : 0;
-  return { head, data: r.slice(4 + hl) };
+  const dataEnd = 4 + hl + head.bytes;
+  // SVT-AV1 first passes append their statistics after the (empty) packets.
+  return { head, data: r.slice(4 + hl, dataEnd), stats: r.slice(dataEnd, dataEnd + head.stats_len) };
 }
 
-const kbpsFor = (bytes, frames, job) => Math.max(1, Math.round((bytes * 8) / (frames * job.fpsDen / job.fpsNum) / 1000));
+const secondsOf = (frames, job) => (frames * job.fpsDen) / job.fpsNum;
+const kbpsFor = (bytes, frames, job) => Math.max(1, Math.round((bytes * 8) / secondsOf(frames, job) / 1000));
+const bpsFor = (bytes, frames, job) => Math.max(1000, Math.round((bytes * 8) / secondsOf(frames, job)));
 
 let awaitingTarget = null;
 
+function setSvtStats(bytes) {
+  const [p, l] = put(bytes);
+  ex.sm_set_stats(p, l);
+  ex.sm_free(p, l);
+}
+
+/**
+ * Two-pass encode of one chunk: a fast first pass, then (once the main
+ * thread has set the byte target) the real pass. With job.stats given,
+ * only the second pass is re-run, from the earlier first pass.
+ */
 async function encode(job) {
   const frames = job.end - job.start;
-  const stats = `/c${job.chunk}`;
-  if (job.stats) {
-    // Re-run of the second pass with stats from an earlier first pass.
-    wasi.fs.write(stats.slice(1), job.stats.log);
-    wasi.fs.write(stats.slice(1) + ".mbtree", job.stats.mbtree);
-  } else {
-    await runPass(job, `bitrate=${kbpsFor(job.planned, frames, job)}:pass=1:stats=${stats}`, true);
+  const av1 = job.preset.startsWith("svt");
+  const statsPath = `c${job.chunk}`;
+  const rc = (bytes, pass) => av1
+    ? `tbr=${bpsFor(bytes, frames, job)}b`
+    : `bitrate=${kbpsFor(bytes, frames, job)}:pass=${pass}:stats=/${statsPath}`;
+  let stats = job.stats;
+  if (!stats) {
+    const p1 = await runPass(job, rc(job.planned, 1), true);
+    stats = av1 ? { svt: p1.stats } : { log: wasi.fs.read(statsPath), mbtree: wasi.fs.read(statsPath + ".mbtree") };
     postMessage({ type: "pass1done", chunk: job.chunk });
     job.target = await new Promise((r) => (awaitingTarget = r));
   }
-  const res = await runPass(job, `bitrate=${kbpsFor(job.target, frames, job)}:pass=2:stats=${stats}`, false);
-  const log = wasi.fs.read(stats.slice(1));
-  const mbtree = wasi.fs.read(stats.slice(1) + ".mbtree");
-  wasi.fs.remove(stats.slice(1));
-  wasi.fs.remove(stats.slice(1) + ".mbtree");
+  if (av1) {
+    setSvtStats(stats.svt);
+  } else {
+    wasi.fs.write(statsPath, stats.log);
+    wasi.fs.write(statsPath + ".mbtree", stats.mbtree);
+  }
+  const res = await runPass(job, rc(job.target, 2), false);
+  if (!av1) {
+    wasi.fs.remove(statsPath);
+    wasi.fs.remove(statsPath + ".mbtree");
+  }
+  // Copies, so the job's own (possibly reused) buffers are not detached.
+  const kept = av1 ? { svt: stats.svt.slice() } : { log: stats.log.slice(), mbtree: stats.mbtree.slice() };
   return {
-    head: res.head, data: res.data, stats: { log, mbtree },
-    transfer: [res.data.buffer, log.buffer, mbtree.buffer],
+    head: res.head, data: res.data, stats: kept,
+    transfer: [res.data.buffer, ...Object.values(kept).map((b) => b.buffer)],
   };
 }
 

@@ -99,6 +99,7 @@ def quality_at(curve, frames, bytes_, factor=1.0):
 def main():
     params = json.load(open(sys.argv[1]))
     rate, dist = params["rate"], params["dist"]
+    fm.QD = params.get("qd", 6.0)
     for path in sys.argv[2:]:
         rows = fm.load([path])
         d = json.load(open(path))
@@ -130,8 +131,9 @@ def main():
             pred_h.append(hull(pp))
         total_frames = sum(scene_frames)
         name = path.split("/")[-1].replace(".json", "")
-        # Budgets: what uniform CRF 24 / 32 / 40 at full res would cost.
-        for ref_crf in (24, 32, 40):
+        # Budgets: what three uniform CRFs at full res would cost (low, middle
+        # and high in this file's CRF grid).
+        for ref_crf in (crfs[1], crfs[len(crfs) // 2], crfs[-3]):
             budget = sum(r["bytes"] for r in rows if r["rung"] == nr - 1 and r["crf"] == ref_crf)
             oc, _ = allocate(meas_h, budget)
             q_oracle = sum(meas_h[s][oc[s]][1] for s in range(len(scenes))) / total_frames

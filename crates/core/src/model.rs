@@ -38,6 +38,24 @@ pub struct DistParams {
 pub struct Model {
     pub rate: RateParams,
     pub dist: DistParams,
+    /// CRF units per doubling of the quantizer step (6 for H.264's QP).
+    pub q_double: f64,
+    /// CRF range the planner searches.
+    pub crf_min: f64,
+    pub crf_max: f64,
+    /// Two-pass size bias: actual/requested ~ base + per_frame / frames.
+    pub bias_base: f64,
+    pub bias_per_frame: f64,
+    /// Relative size error of one two-pass chunk (sd).
+    pub chunk_sigma: f64,
+}
+
+impl Model {
+    /// Quantizer step (in H.264 QP terms) at a CRF.
+    #[inline]
+    pub fn qstep(&self, q: f64) -> f64 {
+        0.625 * 2f64.powf(q / self.q_double)
+    }
 }
 
 /// Default x264 preset. The model is fitted per preset; the encoder must
@@ -59,30 +77,75 @@ pub fn x264_opts(preset: &str) -> String {
 // 30/60 fps, 8 CRFs x 4 rungs, true PSNR from decoded output); see MODEL.md.
 pub const MEDIUM: Model = Model {
     rate: RateParams {
-        a_i: 8.5279, b_i: 5.2786, c_i: 0.2436, a_p: 3.9171, b_p: 0.0471, c_p: 0.7964,
-        d_i: -4.1704, d_p: 1.9340, tau: 0.6879, tau_hf: 1.9390, mv_p: 3.9643,
+        a_i: 8.527947972584839, b_i: 5.278589195496304, c_i: 0.24358782558543007,
+        a_p: 3.9171040865360456, b_p: 0.047090979339267654, c_p: 0.7963571021775048,
+        d_i: -4.170370166263235, d_p: 1.933984216401496, tau: 0.687901350586257, tau_hf: 1.9389995416382755, mv_p: 3.9642794429599797,
     },
-    dist: DistParams { ln_a: -3.6053, b: 1.2271, g: 0.8583 },
+    dist: DistParams { ln_a: -3.6052932762756376, b: 1.2271408234489998, g: 0.8583397234367744 },
+    q_double: 6.0,
+    crf_min: 12.0,
+    crf_max: 51.0,
+    // x264's second pass overshoots short chunks (lab and browser runs).
+    bias_base: 1.03,
+    bias_per_frame: 1.5,
+    chunk_sigma: 0.03,
 };
 
 pub const VERYFAST: Model = Model {
     rate: RateParams {
-        a_i: 7.3940, b_i: 4.4007, c_i: 0.4093, a_p: 3.6618, b_p: 0.3717, c_p: 0.5912,
-        d_i: -3.5310, d_p: 1.9321, tau: 0.7236, tau_hf: 1.9444, mv_p: 2.9655,
+        a_i: 7.393969865707169, b_i: 4.400717455386344, c_i: 0.4093293004668074,
+        a_p: 3.6618344143271266, b_p: 0.3717157969746513, c_p: 0.5912442185287187,
+        d_i: -3.5310281261410803, d_p: 1.9320865810476782, tau: 0.723612594712486, tau_hf: 1.9443700819162792, mv_p: 2.9655491934869476,
     },
-    dist: DistParams { ln_a: -2.9743, b: 1.2455, g: 0.7438 },
+    dist: DistParams { ln_a: -2.9743123990412705, b: 1.2455486229916988, g: 0.7437714572286993 },
+    q_double: 6.0,
+    crf_min: 12.0,
+    crf_max: 51.0,
+    bias_base: 1.03,
+    bias_per_frame: 1.5,
+    chunk_sigma: 0.03,
+};
+
+/// SVT-AV1 preset number of an "svtN" preset name, if it is one.
+pub fn svt_preset(preset: &str) -> Option<u32> {
+    preset.strip_prefix("svt").and_then(|p| p.parse().ok())
+}
+
+/// SVT-AV1 options (its CLI names; rate control added by the caller as
+/// `rc`). smallifier.py's tuning (tune=0, no temporal filtering, quant
+/// matrices, aq-mode 2) minus overlays, which multi-pass doesn't allow;
+/// closed GOPs so chunks are independent; lp=1, which makes SVT-AV1 run its
+/// kernels cooperatively on one thread (the wasm build has no threads).
+pub fn svt_opts(preset: u32, rc: &str) -> String {
+    format!(
+        "preset={preset}:{rc}:keyint=300:irefresh-type=2:tune=0:enable-tf=0:enable-qm=1:qm-min=0:qm-max=15:\
+         aq-mode=2:scd=1:enable-overlays=0:film-grain=0:lp=1"
+    )
+}
+
+/// SVT-AV1 preset 8 (CRF 1..63, two-pass VBR with gop-constraint-rc:
+/// chunks land within ~1% of target with no systematic bias).
+pub const SVT8: Model = Model {
+    rate: RateParams {
+        a_i: 6.099890593807541, b_i: 3.7461101041289147, c_i: 0.676754387488648,
+        a_p: 2.372335319717647, b_p: 0.08268569304900862, c_p: 1.135203224275056,
+        d_i: -3.2376343437937116, d_p: 2.368175503266811, tau: 0.8379292927225688, tau_hf: 1.234389512193184, mv_p: 0.5952344625489631,
+    },
+    dist: DistParams { ln_a: -3.0247568848677346, b: 0.8369546436111518, g: 1.0378966140527712 },
+    q_double: 10.597564844496198,
+    crf_min: 10.0,
+    crf_max: 63.0,
+    bias_base: 1.0,
+    bias_per_frame: 0.0,
+    chunk_sigma: 0.02,
 };
 
 pub fn model_for(preset: &str) -> &'static Model {
     match preset {
         "veryfast" => &VERYFAST,
+        "svt8" => &SVT8,
         _ => &MEDIUM,
     }
-}
-
-#[inline]
-pub fn qstep(q: f64) -> f64 {
-    0.625 * 2f64.powf(q / 6.0)
 }
 
 /// Analysis aggregated over one chunk: its first frame coded as I, the
@@ -191,8 +254,9 @@ fn freq(k: usize) -> f64 {
 }
 
 /// (nonzero count, sum of log2 levels) for a histogram at quantizer q.
-fn features(hist: &[u32], gain: &Gain, q: f64, p: &RateParams) -> (f64, f64) {
-    let inv_step = 1.0 / qstep(q);
+fn features(m: &Model, hist: &[u32], gain: &Gain, q: f64) -> (f64, f64) {
+    let p = &m.rate;
+    let inv_step = 1.0 / m.qstep(q);
     let (mut nz, mut lv) = (0.0, 0.0);
     for k in 0..NPOS {
         let t = p.tau * (1.0 + p.tau_hf * freq(k));
@@ -213,13 +277,29 @@ fn features(hist: &[u32], gain: &Gain, q: f64, p: &RateParams) -> (f64, f64) {
     (nz, lv)
 }
 
+/// The terms of `predict_bytes` in bits (I, I overhead, P, P overhead, MV),
+/// for diagnostics.
+pub fn predict_terms(m: &Model, c: &ChunkStats, gain: &Gain, crf: f64) -> [f64; 5] {
+    let p = &m.rate;
+    let (nz_i, lv_i) = features(m, &c.i_hist, gain, crf + p.d_i);
+    let (nz_p, lv_p) = features(m, &c.p_hist, gain, crf + p.d_p);
+    let scale = c.p_frames() / c.p_sampled.max(1) as f64;
+    [
+        p.a_i * nz_i + p.b_i * lv_i,
+        p.c_i * c.mbs_per_frame,
+        scale * (p.a_p * nz_p + p.b_p * lv_p),
+        p.c_p * c.mbs_per_frame * c.p_frames(),
+        p.mv_p * c.mv_cost * scale * m.qstep(30.0) / m.qstep(crf),
+    ]
+}
+
 /// Predicted encoded size of a chunk, in bytes.
 pub fn predict_bytes(m: &Model, c: &ChunkStats, gain: &Gain, crf: f64) -> f64 {
     let p = &m.rate;
-    let (nz_i, lv_i) = features(&c.i_hist, gain, crf + p.d_i, p);
-    let (nz_p, lv_p) = features(&c.p_hist, gain, crf + p.d_p, p);
+    let (nz_i, lv_i) = features(m, &c.i_hist, gain, crf + p.d_i);
+    let (nz_p, lv_p) = features(m, &c.p_hist, gain, crf + p.d_p);
     let scale = c.p_frames() / c.p_sampled.max(1) as f64;
-    let mv = p.mv_p * c.mv_cost * scale * qstep(30.0) / qstep(crf);
+    let mv = p.mv_p * c.mv_cost * scale * m.qstep(30.0) / m.qstep(crf);
     let bits = p.a_i * nz_i + p.b_i * lv_i + p.c_i * c.mbs_per_frame
         + scale * (p.a_p * nz_p + p.b_p * lv_p)
         + p.c_p * c.mbs_per_frame * c.p_frames()
@@ -260,7 +340,7 @@ pub fn predict_mse(m: &Model, c: &ChunkStats, gain: &Gain, crf: f64) -> f64 {
 /// `predict_mse` with the CRF-independent parts precomputed.
 pub fn predict_mse_with(m: &Model, scale: f64, residual: f64, crf: f64) -> f64 {
     let d = &m.dist;
-    scale + d.ln_a.exp() * qstep(crf).powf(d.b) * residual.max(1e-6).powf(d.g)
+    scale + d.ln_a.exp() * m.qstep(crf).powf(d.b) * residual.max(1e-6).powf(d.g)
 }
 
 /// VMAF (vmaf_v0.6.1neg, the model smallifier.py used) predicted from luma

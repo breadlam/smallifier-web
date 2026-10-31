@@ -1,14 +1,20 @@
 //! MP4 writer for the output: one H.264 track (+ optional Opus track),
 //! `moov` first (fast start), media interleaved in ~0.5 s runs.
 
+/// Decoder configuration of the video track.
+pub enum VideoCodec<'a> {
+    H264 { sps: &'a [u8], pps: &'a [u8] },
+    /// The sequence header OBU (as the encoder emits it, with size field).
+    Av1 { seq_header: &'a [u8] },
+}
+
 pub struct VideoTrack<'a> {
     pub width: u32,
     pub height: u32,
     /// Frame rate as a rational.
     pub fps_num: u32,
     pub fps_den: u32,
-    pub sps: &'a [u8],
-    pub pps: &'a [u8],
+    pub codec: VideoCodec<'a>,
     /// Clockwise rotation to signal (0/90/180/270).
     pub rotation: u32,
     /// In decode order. `pts` is in frames.
@@ -116,7 +122,11 @@ pub fn write(v: &VideoTrack, a: Option<&AudioTrack>) -> Vec<u8> {
     ftyp.bx(b"ftyp", |w| {
         w.bytes(b"isom");
         w.u32(0x200);
-        for b in [b"isom", b"iso2", b"avc1", b"mp41"] {
+        let codec_brand = match v.codec {
+            VideoCodec::H264 { .. } => b"avc1",
+            VideoCodec::Av1 { .. } => b"av01",
+        };
+        for b in [b"isom", b"iso2", codec_brand, b"mp41"] {
             w.bytes(b);
         }
     });
@@ -233,7 +243,11 @@ fn moov(v: &VideoTrack, a: Option<&AudioTrack>, runs: &[Run], data_start: u64, l
                     w.bx(b"stbl", |w| {
                         w.full(b"stsd", 0, 0, |w| {
                             w.u32(1);
-                            w.bx(b"avc1", |w| {
+                            let entry = match v.codec {
+                                VideoCodec::H264 { .. } => b"avc1",
+                                VideoCodec::Av1 { .. } => b"av01",
+                            };
+                            w.bx(entry, |w| {
                                 w.zeros(6);
                                 w.u16(1);
                                 w.zeros(16);
@@ -250,25 +264,38 @@ fn moov(v: &VideoTrack, a: Option<&AudioTrack>, runs: &[Run], data_start: u64, l
                                 w.bytes(&name);
                                 w.u16(0x18);
                                 w.u16(0xffff);
-                                w.bx(b"avcC", |w| {
-                                    w.u8(1);
-                                    w.u8(v.sps[1]);
-                                    w.u8(v.sps[2]);
-                                    w.u8(v.sps[3]);
-                                    w.u8(0xff);
-                                    w.u8(0xe1);
-                                    w.u16(v.sps.len() as u16);
-                                    w.bytes(v.sps);
-                                    w.u8(1);
-                                    w.u16(v.pps.len() as u16);
-                                    w.bytes(v.pps);
-                                    if matches!(v.sps[1], 100 | 110 | 122 | 144) {
-                                        w.u8(0xfc | 1); // 4:2:0
-                                        w.u8(0xf8);
-                                        w.u8(0xf8);
+                                match v.codec {
+                                    VideoCodec::H264 { sps, pps } => w.bx(b"avcC", |w| {
+                                        w.u8(1);
+                                        w.u8(sps[1]);
+                                        w.u8(sps[2]);
+                                        w.u8(sps[3]);
+                                        w.u8(0xff);
+                                        w.u8(0xe1);
+                                        w.u16(sps.len() as u16);
+                                        w.bytes(sps);
+                                        w.u8(1);
+                                        w.u16(pps.len() as u16);
+                                        w.bytes(pps);
+                                        if matches!(sps[1], 100 | 110 | 122 | 144) {
+                                            w.u8(0xfc | 1); // 4:2:0
+                                            w.u8(0xf8);
+                                            w.u8(0xf8);
+                                            w.u8(0);
+                                        }
+                                    }),
+                                    VideoCodec::Av1 { seq_header } => w.bx(b"av1C", |w| {
+                                        // AV1-ISOBMFF: marker/version, profile/level,
+                                        // tier + 8-bit 4:2:0 colour flags, no
+                                        // presentation delay, then the sequence header.
+                                        let (profile, level, tier) = av1_seq_info(seq_header);
+                                        w.u8(0x81);
+                                        w.u8(profile << 5 | level);
+                                        w.u8(tier << 7 | 0b0000_1100);
                                         w.u8(0);
-                                    }
-                                });
+                                        w.bytes(seq_header);
+                                    }),
+                                }
                                 w.bx(b"colr", |w| {
                                     w.bytes(b"nclx");
                                     w.u16(1);
@@ -407,6 +434,74 @@ fn moov(v: &VideoTrack, a: Option<&AudioTrack>, runs: &[Run], data_start: u64, l
     w.0
 }
 
+struct Bits<'a> {
+    d: &'a [u8],
+    pos: usize,
+}
+
+impl Bits<'_> {
+    fn f(&mut self, n: usize) -> u64 {
+        let mut v = 0u64;
+        for _ in 0..n {
+            let byte = self.d.get(self.pos / 8).copied().unwrap_or(0);
+            v = v << 1 | ((byte >> (7 - self.pos % 8)) & 1) as u64;
+            self.pos += 1;
+        }
+        v
+    }
+
+    fn uvlc(&mut self) -> u64 {
+        let mut zeros = 0;
+        while self.f(1) == 0 && zeros < 32 {
+            zeros += 1;
+        }
+        if zeros >= 32 { u64::MAX } else { self.f(zeros) + (1u64 << zeros) - 1 }
+    }
+}
+
+/// (seq_profile, seq_level_idx[0], seq_tier[0]) from a sequence header OBU.
+pub fn av1_seq_info(obu: &[u8]) -> (u8, u8, u8) {
+    if obu.is_empty() {
+        return (0, 31, 0);
+    }
+    let ext = (obu[0] >> 2) & 1;
+    let has_size = (obu[0] >> 1) & 1;
+    let mut p = 1 + ext as usize;
+    if has_size == 1 {
+        while p < obu.len() && obu[p] & 0x80 != 0 {
+            p += 1;
+        }
+        p += 1;
+    }
+    let mut b = Bits { d: &obu[p.min(obu.len())..], pos: 0 };
+    let profile = b.f(3) as u8;
+    let _still = b.f(1);
+    if b.f(1) == 1 {
+        // reduced_still_picture_header
+        return (profile, b.f(5) as u8, 0);
+    }
+    if b.f(1) == 1 {
+        // timing_info, then decoder_model_info if present
+        b.f(32);
+        b.f(32);
+        if b.f(1) == 1 {
+            b.uvlc();
+        }
+        if b.f(1) == 1 {
+            b.f(5);
+            b.f(32);
+            b.f(5);
+            b.f(5);
+        }
+    }
+    b.f(1); // initial_display_delay_present_flag
+    b.f(5); // operating_points_cnt_minus_1
+    b.f(12); // operating_point_idc[0]
+    let level = b.f(5) as u8;
+    let tier = if level > 7 { b.f(1) as u8 } else { 0 };
+    (profile, level, tier)
+}
+
 fn hdlr(w: &mut W, typ: &[u8; 4], name: &str) {
     w.full(b"hdlr", 0, 0, |w| {
         w.u32(0);
@@ -471,4 +566,16 @@ pub fn overhead_estimate(frames: usize, fps: f64, audio_packets: usize, has_audi
     // stsz 4/sample, ctts <= 8/frame (assume worst case), stss ~4 per 2 s,
     // stco 4 per run.
     base + frames * (4 + 8) + frames / 30 + audio_packets * 4 + (runs_v + runs_a) * 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn av1_sequence_header_fields() {
+        // As SVT-AV1 4.2 writes it for 1280x720 at 30 fps.
+        let obu = [0x0a, 0x0c, 0x02, 0x00, 0x00, 0x2d, 0x2a, 0x67, 0xfd, 0x9e, 0x01, 0x7c, 0x00, 0x20];
+        assert_eq!(av1_seq_info(&obu), (0, 5, 0));
+    }
 }

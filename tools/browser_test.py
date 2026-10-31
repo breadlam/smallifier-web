@@ -37,7 +37,8 @@ def main():
     ap.add_argument("--target", type=float, default=10)
     ap.add_argument("--unit", default="1000000")
     ap.add_argument("--browser", default="chromium")
-    ap.add_argument("--preset", default="medium")
+    ap.add_argument("--codec", default="h264")
+    ap.add_argument("--preset", default=None, help="default: the codec's first preset")
     ap.add_argument("--fps", default="30")
     ap.add_argument("--maxres", default="auto")
     ap.add_argument("--audio", default="auto")
@@ -76,7 +77,9 @@ def main():
             return
         page.fill("#target", str(args.target))
         page.select_option("#unit", args.unit)
-        page.select_option("#preset", args.preset)
+        page.select_option("#codec", args.codec)
+        if args.preset:
+            page.select_option("#preset", args.preset)
         page.select_option("#fps", args.fps)
         page.select_option("#maxres", args.maxres)
         page.select_option("#audio", args.audio)
@@ -91,7 +94,20 @@ def main():
             print("ERROR:", page.text_content("#error"))
             sys.exit(1)
         res = page.evaluate("window.__smallifierResult")
+        res.pop("perChunk", None)
         print(json.dumps(res), f"wall {dt:.1f}s")
+        # Can this browser actually play the result? Load, seek to the middle,
+        # and confirm a frame was decoded there.
+        play = page.evaluate("""() => new Promise((res) => {
+            const v = document.getElementById('preview');
+            const fail = () => res({ error: v.error ? v.error.code : 'unknown' });
+            const seeked = () => res({ w: v.videoWidth, h: v.videoHeight, duration: v.duration, at: v.currentTime });
+            const loaded = () => { v.addEventListener('seeked', seeked, { once: true }); v.currentTime = v.duration / 2; };
+            v.addEventListener('error', fail, { once: true });
+            if (v.readyState >= 2) loaded(); else v.addEventListener('loadeddata', loaded, { once: true });
+            setTimeout(() => res({ timeout: true, readyState: v.readyState }), 20000);
+        })""")
+        print("in-page playback:", json.dumps(play))
         b64 = page.evaluate("""async () => {
             const blob = await (await fetch(document.getElementById('download').href)).blob();
             const buf = new Uint8Array(await blob.arrayBuffer());

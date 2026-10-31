@@ -3,5 +3,6 @@
 /testdata
 /third_party
 /web/smallifier.wasm
+/web/smallifier-av1.wasm
 /_site
 __pycache__/

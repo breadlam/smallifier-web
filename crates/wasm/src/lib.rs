@@ -26,6 +26,7 @@ struct State {
     input: Option<Frame>,
     ana: Option<AnaSession>,
     enc: Option<EncSession>,
+    stats: Vec<u8>,
     opus: Option<OpusSession>,
 }
 
@@ -395,9 +396,10 @@ pub unsafe extern "C" fn sm_plan(json_ptr: *const u8, json_len: usize, stats_ptr
             gain: if (w, h) == (inp.out_w, inp.out_h) { Gain::identity() } else { Gain::for_rung(inp.out_w, inp.out_h, w, h) },
         })
         .collect();
-    let p = plan::allocate(model::model_for(&inp.preset), &chunks, &chunk_stats, &rungs, inp.budget);
+    let m = model::model_for(&inp.preset);
+    let p = plan::allocate(m, &chunks, &chunk_stats, &rungs, inp.budget);
     let frames: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
-    with(|s| s.controller = Some(Controller::new(inp.budget, p.chunk_bytes.clone(), frames)));
+    with(|s| s.controller = Some(Controller::new(inp.budget, p.chunk_bytes.clone(), frames, m)));
     json_out(json!({ "chunks": chunks, "plan": p, "cuts": cuts }))
 }
 
@@ -445,29 +447,66 @@ struct EncIn {
     rung_h: usize,
     fps_num: u32,
     fps_den: u32,
+    /// x264 preset ("medium", ...) or "svtN" for SVT-AV1 preset N.
     preset: String,
-    /// Rate control and pass options, e.g. "bitrate=900:pass=1:stats=/s0".
+    /// Rate control and pass options: x264 "bitrate=900:pass=1:stats=/s0";
+    /// SVT-AV1 "tbr=900000b" (the pass comes from `first_pass`, and the
+    /// second pass takes the statistics given to sm_set_stats).
     rc: String,
     first_pass: bool,
 }
 
+enum Encoder {
+    X264(X264),
+    #[cfg(feature = "av1")]
+    Av1(codecs::av1::Svt),
+}
+
+struct OutPacket {
+    data: Vec<u8>,
+    pts: i64,
+    key: bool,
+    psnr_y: f64,
+}
+
 struct EncSession {
-    x264: X264,
+    enc: Encoder,
     scaler: Option<FrameScaler>,
     prefilter: Option<Prefilter>,
-    packets: Vec<codecs::Packet>,
+    packets: Vec<OutPacket>,
     frames: i64,
     keep: bool,
 }
 
+/// First-pass statistics for the next SVT-AV1 second pass.
+///
 /// # Safety
 /// `ptr` must reference `len` readable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sm_enc_begin(ptr: *const u8, len: usize) -> i32 {
-    let e: EncIn = match serde_json::from_slice(unsafe { slice(ptr, len) }) {
-        Ok(v) => v,
-        Err(e) => return err(format!("encode input: {e}")),
-    };
+pub unsafe extern "C" fn sm_set_stats(ptr: *const u8, len: usize) {
+    let v = unsafe { slice(ptr, len) }.to_vec();
+    with(|s| s.stats = v);
+}
+
+fn open_encoder(e: &EncIn) -> Result<Encoder, String> {
+    if let Some(_p) = model::svt_preset(&e.preset) {
+        #[cfg(feature = "av1")]
+        {
+            let stats = if e.first_pass { Vec::new() } else { with(|s| std::mem::take(&mut s.stats)) };
+            let cfg = codecs::av1::SvtConfig {
+                width: e.out_w as u32,
+                height: e.out_h as u32,
+                fps_num: e.fps_num,
+                fps_den: e.fps_den,
+                opts: model::svt_opts(_p, &format!("rc=1:{}:gop-constraint-rc=1", e.rc)),
+                pass: if e.first_pass { 1 } else { 2 },
+                stats,
+            };
+            return codecs::av1::Svt::open(&cfg).map(Encoder::Av1);
+        }
+        #[cfg(not(feature = "av1"))]
+        return Err("this module was built without AV1".into());
+    }
     let mut opts = format!("{}:{}", model::x264_opts(&e.preset), e.rc);
     if e.first_pass {
         opts.push_str(":fastfirstpass");
@@ -482,13 +521,24 @@ pub unsafe extern "C" fn sm_enc_begin(ptr: *const u8, len: usize) -> i32 {
         opts,
         stats: !e.first_pass,
     };
-    let x264 = match X264::open(&cfg) {
+    X264::open(&cfg).map(Encoder::X264)
+}
+
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sm_enc_begin(ptr: *const u8, len: usize) -> i32 {
+    let e: EncIn = match serde_json::from_slice(unsafe { slice(ptr, len) }) {
+        Ok(v) => v,
+        Err(e) => return err(format!("encode input: {e}")),
+    };
+    let enc = match open_encoder(&e) {
         Ok(x) => x,
         Err(m) => return err(m),
     };
     let scaler = ((e.src_w, e.src_h) != (e.out_w, e.out_h)).then(|| FrameScaler::new(e.src_w, e.src_h, e.out_w, e.out_h));
     let prefilter = Prefilter::new(e.out_w, e.out_h, e.rung_w, e.rung_h);
-    with(|s| s.enc = Some(EncSession { x264, scaler, prefilter, packets: Vec::new(), frames: 0, keep: !e.first_pass }));
+    with(|s| s.enc = Some(EncSession { enc, scaler, prefilter, packets: Vec::new(), frames: 0, keep: !e.first_pass }));
     0
 }
 
@@ -502,52 +552,90 @@ pub extern "C" fn sm_enc_push() -> i32 {
             Some(p) => p.apply(&f),
             None => f,
         };
-        let r = e.x264.encode(&f.y.data, &f.u.data, &f.v.data, f.y.w, f.u.w, e.frames, e.frames == 0);
+        let pts = e.frames;
         e.frames += 1;
-        match r {
-            Ok(Some(p)) => {
-                if e.keep {
-                    e.packets.push(p)
-                } else {
-                    e.packets.push(codecs::Packet { data: Vec::new(), ..p })
+        match &mut e.enc {
+            Encoder::X264(x) => match x.encode(&f.y.data, &f.u.data, &f.v.data, f.y.w, f.u.w, pts, pts == 0) {
+                Ok(Some(p)) => {
+                    let data = if e.keep { p.data } else { Vec::new() };
+                    e.packets.push(OutPacket { data, pts: p.pts, key: p.keyframe, psnr_y: p.psnr_y });
+                    0
                 }
-                0
-            }
-            Ok(None) => 0,
-            Err(_) => -1,
+                Ok(None) => 0,
+                Err(_) => -1,
+            },
+            #[cfg(feature = "av1")]
+            Encoder::Av1(a) => match a.send(&f.y.data, &f.u.data, &f.v.data, f.y.w, f.u.w, pts) {
+                Ok(()) => 0,
+                Err(_) => -1,
+            },
         }
     })
 }
 
-/// Result: [json len u32][json][packet data...]; json has sps/pps (hex),
-/// per-packet [size, pts, key] and the mean luma MSE x264 measured against
-/// its (prefiltered) input.
+/// Result: [json len u32][json][packet data...][first-pass stats...]; json
+/// has the codec, its decoder configuration (H.264 sps/pps, or the AV1
+/// sequence header) as hex, per-packet [size, pts, key], the mean luma MSE
+/// the encoder measured against its (prefiltered) input (x264 only; -1 for
+/// AV1) and the length of the trailing first-pass statistics (AV1 only).
 #[unsafe(no_mangle)]
 pub extern "C" fn sm_enc_end() -> i32 {
     let Some(mut e) = with(|s| s.enc.take()) else { return err("no encode session") };
-    loop {
-        match e.x264.flush() {
-            Ok(Some(p)) => e.packets.push(if e.keep { p } else { codecs::Packet { data: Vec::new(), ..p } }),
-            Ok(None) => break,
-            Err(m) => return err(m),
-        }
-    }
     let hex = |v: &[u8]| v.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let mse: f64 = e.packets.iter().map(|p| 65025.0 / 10f64.powf(p.psnr_y / 10.0)).sum::<f64>()
-        / e.packets.len().max(1) as f64;
-    let table: Vec<[i64; 3]> = e.packets.iter().map(|p| [p.data.len() as i64, p.pts, p.keyframe as i64]).collect();
+    #[cfg_attr(not(feature = "av1"), allow(unused_mut))]
+    let mut stats = Vec::new();
+    let config = match &mut e.enc {
+        Encoder::X264(x) => {
+            loop {
+                match x.flush() {
+                    Ok(Some(p)) => {
+                        let data = if e.keep { p.data } else { Vec::new() };
+                        e.packets.push(OutPacket { data, pts: p.pts, key: p.keyframe, psnr_y: p.psnr_y });
+                    }
+                    Ok(None) => break,
+                    Err(m) => return err(m),
+                }
+            }
+            json!({ "codec": "h264", "sps": hex(&x.sps()), "pps": hex(&x.pps()) })
+        }
+        #[cfg(feature = "av1")]
+        Encoder::Av1(a) => {
+            match a.finish() {
+                Ok(ps) => {
+                    for p in ps {
+                        let data = if e.keep { p.data } else { Vec::new() };
+                        e.packets.push(OutPacket { data, pts: p.pts, key: p.keyframe, psnr_y: -1.0 });
+                    }
+                }
+                Err(m) => return err(m),
+            }
+            if !e.keep {
+                stats = a.stats();
+            }
+            json!({ "codec": "av1", "av1_header": hex(&a.header()) })
+        }
+    };
+    let measured = e.packets.iter().all(|p| p.psnr_y > 0.0) && !e.packets.is_empty();
+    let mse: f64 = if measured {
+        e.packets.iter().map(|p| 65025.0 / 10f64.powf(p.psnr_y / 10.0)).sum::<f64>() / e.packets.len() as f64
+    } else {
+        -1.0
+    };
+    let table: Vec<[i64; 3]> = e.packets.iter().map(|p| [p.data.len() as i64, p.pts, p.key as i64]).collect();
     let bytes: usize = e.packets.iter().map(|p| p.data.len()).sum();
-    let head = serde_json::to_vec(&json!({
-        "sps": hex(&e.x264.sps()), "pps": hex(&e.x264.pps()), "packets": table,
-        "bytes": bytes, "mse": mse,
-    }))
-    .unwrap();
-    let mut out = Vec::with_capacity(4 + head.len() + bytes);
+    let mut head = config;
+    head["packets"] = json!(table);
+    head["bytes"] = json!(bytes);
+    head["mse"] = json!(mse);
+    head["stats_len"] = json!(stats.len());
+    let head = serde_json::to_vec(&head).unwrap();
+    let mut out = Vec::with_capacity(4 + head.len() + bytes + stats.len());
     out.extend_from_slice(&(head.len() as u32).to_le_bytes());
     out.extend_from_slice(&head);
     for p in &e.packets {
         out.extend_from_slice(&p.data);
     }
+    out.extend_from_slice(&stats);
     ok(out)
 }
 
@@ -760,8 +848,15 @@ struct MuxIn {
     fps_num: u32,
     fps_den: u32,
     rotation: u32,
+    /// "h264" (sps/pps) or "av1" (av1_header).
+    #[serde(default)]
+    codec: String,
+    #[serde(default)]
     sps: String,
+    #[serde(default)]
     pps: String,
+    #[serde(default)]
+    av1_header: String,
     /// [size, pts, key] per video sample, decode order.
     video: Vec<[i64; 3]>,
     audio: Option<MuxAudio>,
@@ -791,7 +886,7 @@ pub unsafe extern "C" fn sm_mux(json_ptr: *const u8, json_len: usize, data: *con
         Err(e) => return err(format!("mux input: {e}")),
     };
     let data = unsafe { slice(data, data_len) };
-    let (sps, pps) = (unhex(&m.sps), unhex(&m.pps));
+    let (sps, pps, av1_header) = (unhex(&m.sps), unhex(&m.pps), unhex(&m.av1_header));
     let mut pos = 0usize;
     let mut samples = Vec::with_capacity(m.video.len());
     for v in &m.video {
@@ -817,8 +912,11 @@ pub unsafe extern "C" fn sm_mux(json_ptr: *const u8, json_len: usize, data: *con
         height: m.height,
         fps_num: m.fps_num,
         fps_den: m.fps_den,
-        sps: &sps,
-        pps: &pps,
+        codec: if m.codec == "av1" {
+            mux::VideoCodec::Av1 { seq_header: &av1_header }
+        } else {
+            mux::VideoCodec::H264 { sps: &sps, pps: &pps }
+        },
         rotation: m.rotation,
         samples,
     };

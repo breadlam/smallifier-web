@@ -7,6 +7,7 @@ mkdir -p third_party
 
 X264_REV=b35605ace3ddf7c1a5d67a2eb553f034aef41d55   # stable branch, X264_BUILD 165
 OPUS_TAG=v1.5.2
+SVT_AV1_TAG=v4.2.0                                    # 9292ec8e32bce26f781f277ec8739b53426c4300
 WASI_SDK=wasi-sdk-34
 WASI_SDK_SHA256=b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
 
@@ -16,6 +17,9 @@ if [ ! -d third_party/x264 ]; then
 fi
 if [ ! -d third_party/opus ]; then
   git clone -q --depth 1 -b "$OPUS_TAG" https://github.com/xiph/opus.git third_party/opus
+fi
+if [ ! -d third_party/svt-av1 ]; then
+  git clone -q --depth 1 -b "$SVT_AV1_TAG" https://gitlab.com/AOMediaCodec/SVT-AV1.git third_party/svt-av1
 fi
 if [ ! -e third_party/wasi-sdk ]; then
   case "$(uname -s)-$(uname -m)" in

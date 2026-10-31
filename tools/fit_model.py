@@ -72,8 +72,13 @@ def load(paths):
     return rows
 
 
+# CRF units per doubling of the quantizer step: 6 for H.264 (QP), fitted
+# for SVT-AV1 (whose CRF maps to qindex).
+QD = 6.0
+
+
 def qstep(q):
-    return 0.625 * 2.0 ** (q / 6.0)
+    return 0.625 * 2.0 ** (q / QD)
 
 
 FREQ = np.array([(k % 8) + (k // 8) for k in range(64)], dtype=np.float64) / 14.0
@@ -112,7 +117,10 @@ def predict(params, r, which="P"):
 
 
 def residuals(params, rows, which="P"):
-    return np.array([np.log(predict(params, r, which) / r["bytes"]) for r in rows])
+    global QD
+    if len(params) > len(NAMES):
+        QD = params[len(NAMES)]
+    return np.array([np.log(predict(params[:len(NAMES)], r, which) / r["bytes"]) for r in rows])
 
 
 def report(label, params, rows, which="P"):
@@ -135,8 +143,19 @@ def main():
     rows = load(args)
     train = [r for r in rows if not (holdout and r["clip"].startswith(holdout))]
     test = [r for r in rows if holdout and r["clip"].startswith(holdout)]
-    fit = least_squares(residuals, X0, bounds=(LO, HI), args=(train,), loss="soft_l1", f_scale=0.1)
-    p = fit.x
+    global QD
+    av1 = any(json.load(open(a))["preset"].startswith("svt") for a in args)
+    if av1:
+        # Also fit the CRF scale.
+        fit = least_squares(residuals, X0 + [7.0], bounds=(LO + [3.0], HI + [16.0]), args=(train,), loss="soft_l1",
+                            f_scale=0.1)
+        QD = fit.x[-1]
+        p = fit.x[:len(NAMES)]
+        print(f"qd (CRF per doubling) = {QD:.4f}")
+    else:
+        QD = 6.0
+        fit = least_squares(residuals, X0, bounds=(LO, HI), args=(train,), loss="soft_l1", f_scale=0.1)
+        p = fit.x
     print("params:", ", ".join(f"{n}={v:.4f}" for n, v in zip(NAMES, p)))
     report("train", p, train)
     for clip in sorted({r["clip"] for r in rows}):
@@ -146,7 +165,8 @@ def main():
         report(f"all, P sampled ({which})", p, rows, which)
     dp = fit_distortion(p, train)
     if save:
-        json.dump({"rate": list(p), "dist": list(dp), "rate_names": NAMES, "dist_names": D_NAMES}, open(save, "w"), indent=1)
+        json.dump({"rate": list(p), "dist": list(dp), "rate_names": NAMES, "dist_names": D_NAMES, "qd": QD},
+                  open(save, "w"), indent=1)
         print("saved", save)
     if test:
         e = d_residuals(dp, p, [r for r in test if r["true_mse"] > 0])

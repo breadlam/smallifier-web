@@ -64,14 +64,19 @@ class Module {
 
 let wasmModule;
 let wasm;
+const modules = {}; // file name -> compiled module (the AV1 one is fetched on demand)
+
+async function compile(name) {
+  if (!modules[name]) {
+    const url = new URL(name, import.meta.url);
+    modules[name] = WebAssembly.compileStreaming(fetch(url)).catch(async () =>
+      WebAssembly.compile(await (await fetch(url)).arrayBuffer()));
+  }
+  return modules[name];
+}
 
 async function loadWasm() {
-  const url = new URL("smallifier.wasm", import.meta.url);
-  try {
-    wasmModule = await WebAssembly.compileStreaming(fetch(url));
-  } catch {
-    wasmModule = await WebAssembly.compile(await (await fetch(url)).arrayBuffer());
-  }
+  wasmModule = await compile("smallifier.wasm");
   const wasi = new WASI({ stderr: (m) => log(`[wasm] ${m}`) });
   const inst = await WebAssembly.instantiate(wasmModule, wasi.imports);
   wasi.attach(inst);
@@ -270,13 +275,13 @@ function sampleRange(video, vt, fpsN, fpsD, a, b) {
 // ---------------------------------------------------------------- workers
 
 class Worker2 {
-  constructor() {
+  constructor(module) {
     this.w = new Worker(new URL("worker.js", import.meta.url), { type: "module" });
     this.ready = new Promise((resolve, reject) => {
       this.w.onmessage = (e) => (e.data.type === "ready" ? resolve() : reject(new Error(e.data.message)));
       this.w.onerror = (e) => reject(new Error(e.message || "worker failed to start"));
     });
-    this.w.postMessage({ type: "init", module: wasmModule });
+    this.w.postMessage({ type: "init", module });
   }
   /** Runs one job; `on` handles intermediate messages. */
   run(type, job, on = () => {}) {
@@ -301,8 +306,8 @@ class Worker2 {
   }
 }
 
-async function makePool(n) {
-  const pool = Array.from({ length: n }, () => new Worker2());
+async function makePool(n, module = wasmModule) {
+  const pool = Array.from({ length: n }, () => new Worker2(module));
   await Promise.all(pool.map((w) => w.ready));
   return pool;
 }
@@ -314,6 +319,34 @@ async function runOnPool(pool, tasks) {
     while (queue.length) await queue.shift()(w);
   }));
 }
+
+// --------------------------------------------------------------- presets
+
+const PRESETS = {
+  h264: [
+    ["medium", "Balanced (x264 medium)", ""],
+    ["veryfast", "Fast (x264 veryfast)", "About 3× quicker and a little softer."],
+  ],
+  av1: [["svt8", "Balanced (SVT-AV1 preset 8)",
+          "About 4× slower than H.264 Balanced at 720p, and much slower at 1080p."]],
+};
+const CODEC_NOTES = {
+  h264: "",
+  av1: "Noticeably sharper at the same size. Plays in current Chrome, Edge, Firefox and Android; " +
+    "Apple devices need an AV1 hardware decoder (iPhone 15 Pro / M3 Mac or later).",
+};
+
+function fillPresets() {
+  const codec = $("codec").value;
+  const sel = $("preset");
+  sel.innerHTML = PRESETS[codec].map(([v, label]) => `<option value="${v}">${label}</option>`).join("");
+  const note = () => ($("preset-note").textContent = PRESETS[codec].find(([v]) => v === sel.value)?.[2] ?? "");
+  sel.onchange = note;
+  note();
+  $("codec-note").textContent = CODEC_NOTES[codec];
+}
+
+const isAv1 = (preset) => preset.startsWith("svt");
 
 // ------------------------------------------------------------------ main
 
@@ -418,7 +451,12 @@ async function smallify() {
         `audio ${wantAudio ? audioBps / 1000 + " kbps" : "none"}, preset ${preset}, ${nWorkers} workers`);
     if (roughVideo <= 0) throw new Error("The target is too small to hold even the audio. Lower the audio bitrate or raise the target.");
 
-    pool = await makePool(nWorkers);
+    let module = wasmModule;
+    if (isAv1(preset)) {
+      setPhase("Reading", "loading the AV1 encoder");
+      module = await compile("smallifier-av1.wasm");
+    }
+    pool = await makePool(nWorkers, module);
     activePool = pool;
     const base = { file, track: video, t0: vt.start, fpsNum: fpsN, fpsDen: fpsD, srcW: video.width, srcH: video.height,
                    srcFrameDur: 1 / vt.srcFps };
@@ -577,11 +615,13 @@ async function smallify() {
     // ---- mux, then fix up against the real file size
     setPhase("Finishing");
     const mux = () => {
-      const sps = results[0].head.sps;
-      const pps = results[0].head.pps;
-      for (const r of results) {
-        if (r.head.sps !== sps || r.head.pps !== pps) throw new Error("chunk parameter sets differ (internal error)");
+      // All chunks must share one decoder configuration (stitchable x264,
+      // fixed-settings SVT-AV1); the container carries it once.
+      const cfg = (h) => (h.codec === "av1" ? h.av1_header : h.sps + "/" + h.pps);
+      if (results.some((r) => cfg(r.head) !== cfg(results[0].head))) {
+        throw new Error("chunks have different decoder configurations (internal error)");
       }
+      const { codec, sps, pps, av1_header } = results[0].head;
       const vrows = [];
       const parts = [];
       results.forEach((r, c) => {
@@ -589,7 +629,8 @@ async function smallify() {
         parts.push(r.data);
       });
       const muxIn = {
-        width: out.w, height: out.h, fps_num: fpsN, fps_den: fpsD, rotation: video.rotation || 0, sps, pps, video: vrows,
+        width: out.w, height: out.h, fps_num: fpsN, fps_den: fpsD, rotation: video.rotation || 0,
+        codec, sps, pps, av1_header, video: vrows,
       };
       if (audioResult) {
         parts.push(audioResult.data);
@@ -637,6 +678,8 @@ async function smallify() {
     const elapsed = (performance.now() - started) / 1000;
 
     // ---- report
+    // x264 measures its own error; SVT-AV1 doesn't, so AV1 reports the
+    // prediction only.
     let se = 0;
     let n = 0;
     results.forEach((r, c) => {
@@ -644,12 +687,14 @@ async function smallify() {
       se += (r.head.mse + r.head.scale_mse) * f;
       n += f;
     });
-    const psnr = 10 * Math.log10(65025 / (se / n));
+    const measured = results.every((r) => r.head.mse >= 0);
+    const psnr = measured ? 10 * Math.log10(65025 / (se / n)) : NaN;
     showResult(mp4, {
       target, out, fps, frames, plan, chunks, rungs, results, psnr, elapsed, timing, encodes, audioBytes, preset,
       srcSize: file.size,
     });
-    log(`done: ${fmtBytes(mp4.length)} (target ${fmtBytes(target)}), measured PSNR ${psnr.toFixed(2)} dB, ` +
+    log(`done: ${fmtBytes(mp4.length)} (target ${fmtBytes(target)}), ` +
+        (measured ? `measured PSNR ${psnr.toFixed(2)} dB, ` : "") +
         `${encodes} chunk passes for ${chunks.length} chunks, ${elapsed.toFixed(1)} s`);
   } catch (e) {
     showError(e.message);
@@ -674,10 +719,12 @@ function showResult(mp4, r) {
   const rows = [
     ["Size", `${fmtBytes(mp4.length)} of ${fmtBytes(r.target)} target (${((mp4.length / r.target) * 100).toFixed(1)}%)` +
       (ok ? "" : " — over target!")],
-    ["Video", `H.264 ${r.out.w}×${r.out.h} @ ${r.fps.toFixed(2)} fps, ${fmtBytes(mp4.length - r.audioBytes)}`],
+    ["Video", `${isAv1(r.preset) ? "AV1" : "H.264"} ${r.out.w}×${r.out.h} @ ${r.fps.toFixed(2)} fps, ` +
+      `${fmtBytes(mp4.length - r.audioBytes)}`],
     ["Audio", r.audioBytes ? `Opus, ${fmtBytes(r.audioBytes)}` : "none"],
-    ["Quality", `${r.psnr.toFixed(2)} dB PSNR vs. source at output size (predicted ${r.plan.predicted_psnr.toFixed(2)} dB; ` +
-      `predicted VMAF ~${r.plan.predicted_vmaf.toFixed(0)})`],
+    ["Quality", (isFinite(r.psnr) ? `${r.psnr.toFixed(2)} dB PSNR vs. source at output size (predicted ` : "predicted ") +
+      `${r.plan.predicted_psnr.toFixed(2)} dB; predicted VMAF ~${r.plan.predicted_vmaf.toFixed(0)}` +
+      (isFinite(r.psnr) ? ")" : "")],
     ["Work", `${r.chunks.length} chunks, ${r.encodes} encoder passes (fast first pass + final pass per chunk` +
       (r.encodes > 2 * r.chunks.length ? `, ${r.encodes - 2 * r.chunks.length} re-run(s)` : "") + ")"],
     ["Time", `${fmtTime(r.elapsed)} total — analysis ${fmtTime(r.timing.analysis)}, encoding ${fmtTime(r.timing.encode)}`],
@@ -691,15 +738,16 @@ function showResult(mp4, r) {
       let se = 0;
       let n = 0;
       cs.forEach(([c, j]) => {
-        se += (r.results[j].head.mse + r.results[j].head.scale_mse) * (c.end - c.start);
+        se = r.results[j].head.mse < 0 || se < 0 ? -1 : se + (r.results[j].head.mse + r.results[j].head.scale_mse) * (c.end - c.start);
         n += c.end - c.start;
       });
+      const q = se >= 0 ? `${(10 * Math.log10(65025 / (se / n))).toFixed(1)} dB` : `~${s.psnr.toFixed(1)} dB (pred.)`;
       return `<tr><td>${i + 1}</td><td class=num>${s.frames}</td><td>${r.rungs[s.rung].join("×")}</td>` +
         `<td class=num>${fmtBytes(cs.reduce((t, [, j]) => t + r.plan.chunk_bytes[j], 0))}</td>` +
-        `<td class=num>${fmtBytes(actual)}</td><td class=num>${(10 * Math.log10(65025 / (se / n))).toFixed(1)} dB</td></tr>`;
+        `<td class=num>${fmtBytes(actual)}</td><td class=num>${q}</td></tr>`;
     }).join("");
   $("result").hidden = false;
-  window.__smallifierResult = { size: mp4.length, target: r.target, psnr: r.psnr, chunks: r.chunks.length,
+  window.__smallifierResult = { size: mp4.length, target: r.target, psnr: r.psnr, chunks: r.chunks.length, codec: isAv1(r.preset) ? "av1" : "h264",
                                 encodes: r.encodes, elapsed: r.elapsed, out: r.out, fps: r.fps,
                                 perChunk: r.chunks.map((c, j) => ({ start: c.start, end: c.end, rung: r.rungs[r.plan.scenes[c.scene].rung],
                                   mse: r.results[j].head.mse, scale_mse: r.results[j].head.scale_mse, bytes: r.results[j].head.bytes })) };
@@ -734,6 +782,8 @@ async function boot() {
     if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]);
   };
   $("go").onclick = smallify;
+  $("codec").onchange = fillPresets;
+  fillPresets();
   $("cancel").onclick = () => {
     cancelled = true;
     activePool?.forEach((w) => w.terminate());

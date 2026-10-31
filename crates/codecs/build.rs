@@ -30,6 +30,9 @@ fn main() {
     let opus_dir = root.join("third_party/opus");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let wasm = env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "wasm32";
+    // wasm32-wasip1-threads: shared memory, so every object needs atomics.
+    let threads = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default().split(',').any(|f| f == "atomics");
+    let av1 = env::var("CARGO_FEATURE_AV1").is_ok();
 
     for d in [&x264_dir, &opus_dir] {
         if !d.join("COPYING").exists() {
@@ -53,6 +56,9 @@ fn main() {
                 .archiver(sdk.join("bin/llvm-ar"))
                 .flag(format!("--sysroot={}", sdk.join("share/wasi-sysroot").display()))
                 .flag("-msimd128");
+            if threads {
+                b.flag("-pthread");
+            }
         }
         b.opt_level(3).warnings(false).define("NDEBUG", None);
         b
@@ -98,9 +104,63 @@ fn main() {
     b.file("csrc/opus_shim.c");
     b.compile("opus");
 
+    if av1 {
+        build_svt_av1(&root.join("third_party/svt-av1"), &out, base(), wasm && !threads);
+    }
+
     if !wasm {
         println!("cargo:rustc-link-lib=m");
     }
+}
+
+/// SVT-AV1's portable C code (no SIMD kernels; the wasm build gets
+/// autovectorised simd128 instead), compiled the way its CMake would with
+/// COMPILE_C_ONLY, without running CMake.
+/// `single_thread`: replace svt_threads.c with a non-blocking stand-in (for
+/// wasm without threads; the encoder must then run with lp=1).
+fn build_svt_av1(dir: &Path, out: &Path, mut b: cc::Build, single_thread: bool) {
+    if !dir.join("LICENSE.md").exists() {
+        panic!("{} missing: run tools/fetch-deps.sh", dir.display());
+    }
+    let gen_dir = out.join("svtgen");
+    fs::create_dir_all(&gen_dir).unwrap();
+    let tmpl = fs::read_to_string(dir.join("Source/Lib/Codec/EbVersion.h.in")).unwrap();
+    fs::write(gen_dir.join("EbVersion.h"), tmpl.replace("@PACKAGE_VERSION_STRING@", "v4.2.0")).unwrap();
+    let lib = dir.join("Source/Lib");
+    for inc in ["Source/API", "Source/Lib/Codec", "Source/Lib/C_DEFAULT", "Source/Lib/Globals", "third_party/fastfeat"] {
+        b.include(dir.join(inc));
+    }
+    b.include(&gen_dir)
+        .flag("-std=gnu11")
+        .define("_GNU_SOURCE", None)
+        .define("EXCLUDE_HASH", "1")
+        .define("REPRODUCIBLE_BUILDS", "1")
+        .define("EN_AVX512_SUPPORT", "0")
+        .define("HAVE_VALGRIND_H", "0")
+        .define("HAVE_BUILTIN_EXPECT", "1")
+        .define("HAVE_BUILTIN_ASSUME", "0")
+        .define("HAVE_ELF_AUX_INFO", "0")
+        .define("SAFECLIB_STR_NULL_SLACK", "1");
+    for sub in ["Codec", "C_DEFAULT", "Globals"] {
+        let mut files: Vec<PathBuf> = fs::read_dir(lib.join(sub))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "c"))
+            .filter(|p| !(single_thread && p.file_name().is_some_and(|n| n == "svt_threads.c")))
+            .collect();
+        files.sort();
+        b.files(files);
+    }
+    for f in ["fast.c", "fast_9.c", "nonmax.c"] {
+        b.file(dir.join("third_party/fastfeat").join(f));
+    }
+    b.file("csrc/svt_shim.c");
+    if single_thread {
+        b.file("csrc/svt_threads_st.c");
+        b.flag("-include").flag(Path::new("csrc/svt_wasi_compat.h").canonicalize().unwrap().to_str().unwrap());
+    }
+    b.compile("svtav1");
+    println!("cargo:rerun-if-changed={}", lib.display());
 }
 
 /// Reads a `NAME = \` file list out of one of libopus's .mk fragments.

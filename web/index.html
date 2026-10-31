@@ -63,12 +63,16 @@
           <option value="0">No audio</option>
         </select>
       </label>
-      <label>Encoder speed
-        <select id="preset">
-          <option value="medium" selected>Balanced (x264 medium)</option>
-          <option value="veryfast">Fast (x264 veryfast)</option>
+      <label>Video codec
+        <select id="codec">
+          <option value="h264" selected>H.264 (plays everywhere)</option>
+          <option value="av1">AV1 (smaller files, newer devices)</option>
         </select>
-        <small>Fast is about 3× quicker and a little softer.</small>
+        <small id="codec-note"></small>
+      </label>
+      <label>Encoder speed
+        <select id="preset"></select>
+        <small id="preset-note"></small>
       </label>
       <label>Parallel workers
         <select id="workers"></select>
@@ -109,7 +113,7 @@
   <p>How it works: one cheap analysis pass predicts, for every scene, how large and how good the encode would be at each
   resolution and quality setting. The budget is spent where it buys the most quality, then each chunk is encoded once
   with two-pass x264 to land on its share. Output is H.264 + Opus in MP4, which plays almost everywhere.</p>
-  <p>x264 (GPL) and libopus are compiled to WebAssembly; decoding uses your browser's WebCodecs.</p>
+  <p>x264 (GPL), SVT-AV1 and libopus are compiled to WebAssembly; decoding uses your browser's WebCodecs.</p>
 </footer>
 
 <script type="module" src="app.js"></script>

@@ -130,7 +130,63 @@ scene-length candidates per scene with SVT-AV1 preset 2 and VMAF-score each
 x264 and never VMAF-scored. AV1 would still be ~30% smaller at equal
 quality — the price of playing everywhere.
 
-## 6. Things found along the way
+## 6. AV1 (optional)
+
+**Encoder.** SVT-AV1 4.2 (what smallifier.py used), built from source like
+x264. It normally runs a pipeline of ~16 threads, which in a browser would
+need WASM threads, SharedArrayBuffer and cross-origin-isolation headers
+(GitHub Pages can't set them). But since 4.x, at `lp=1` it registers its
+kernels with a cooperative dispatcher on the calling thread
+(`CONFIG_SINGLE_THREAD_KERNEL`), so the wasm build uses plain WASI: the
+library's `svt_threads.c` is swapped for a non-blocking single-thread
+stand-in (`crates/codecs/csrc/svt_threads_st.c`). AV1 therefore works
+wherever the H.264 path does, including Firefox private windows. It ships
+as a second module (`smallifier-av1.wasm`, 4.3 MB) fetched only when AV1 is
+chosen. Settings: preset 8, smallifier.py's tuning (tune 0, no temporal
+filtering, quant matrices, aq-mode 2), closed GOP, no overlays (multi-pass
+doesn't allow them).
+
+**Rate control.** Two-pass VBR per chunk, per chunk of the lab clips at
+realistic budgets:
+
+| SVT-AV1 two-pass | median size error | p90 | per-clip bias |
+|---|---|---|---|
+| default | 2.0% | 7.0% | −2 to −6% |
+| `gop-constraint-rc=1` | **0.9%** | **2.7%** | within ±1% |
+
+(the first pass costs ~20% of the second). With the GOP constraint it is
+more accurate than x264's two-pass, so the controller uses no bias prior
+and a 2% per-chunk uncertainty.
+
+**Model.** Refitted on the same lab design with SVT-AV1 encodes (CRF
+20…62, ~3,400 encodes); SVT-AV1's CRF doubles the quantiser step every
+~10.6 units (H.264 QP: 6). Distortion prediction is better than for x264
+(median 0.28 dB, p90 1.15 dB). Planning from predictions versus the
+measured oracle: mean gap 0.17 VMAF-proxy points (worst 0.81) over 33
+clip × budget cases; here the oracle barely beats a uniform CRF (+0.04),
+so SVT-AV1's own allocation is already good and the planner's job is
+mostly the rungs and the bytes.
+
+**Result.** 60 s 1080p60 game clips in the browser (Chromium, 6 workers),
+against plain x264 two-pass at the same video bitrate on identical frames
+(`tools/compare_vmaf.py`):
+
+| Clip (target) | wall time | size | AV1 VMAF mean / p5 | x264 2-pass VMAF mean / p5 | PSNR (AV1 / x264) |
+|---|---|---|---|---|---|
+| GTA V (8 MB) | 173 s | 7.96 MB | **89.2** / 81.5 | 78.7 / 67.6 | 36.20 / 33.65 dB |
+| CS:GO (10 MB) | 231 s | 9.96 MB | **82.7** / 72.3 | 67.8 / 58.7 | 31.29 / 29.12 dB |
+| StarCraft 2 (6 MB) | 69 s | 5.90 MB | **93.9** / 90.9 | 90.4 / 87.8 | 38.43 / 36.56 dB |
+| DOTA 2 (8 MB) | 214 s | 7.96 MB | **88.5** / 82.5 | 80.3 / 75.4 | 35.94 / 33.43 dB |
+
+Two passes per chunk everywhere (no re-runs), every chunk within ~2% of
+its target; predicted PSNR within ~0.2 dB of measured (GTA V: 36.36 vs
+36.20). Plays back in Chromium and Firefox. Firefox took 378 s for GTA V
+(7.95 MB) while the machine was busy with other work. Encoder memory
+~200 MB per worker at 720p, ~350 MB at 1080p; second-pass speed in wasm
+~2.5 fps (720p) / 0.5 fps (1080p) per worker at preset 8, so 1080p
+output is slow.
+
+## 7. Things found along the way
 
 * wasm-ld links a cdylib for WASI as a *command* unless `__wasm_call_ctors`
   is referenced: every export then runs libc destructors on return, whose
@@ -138,11 +194,16 @@ quality — the price of playing everywhere.
   second pass read its stats file misaligned ("MB-tree frametype 255").
   The module exports `_initialize` (reactor) instead.
 * x264 only computes PSNR at log level ≥ INFO.
+* SVT-AV1's two-pass is far off on short, scene-spanning test clips but
+  accurate on real chunks; judge rate control on the chunks the app makes.
+* Model constants must be ported at full precision (`tools/port_model.py`):
+  rounding them to 4 decimals flipped one 5.8-million-coefficient histogram
+  bin across a quantiser threshold and moved a prediction by 4%.
 * ffmpeg's `gray` pixel format is full range: decoding limited-range video
   to `gray` for comparisons silently scales luma (−1.3 dB, or "29 dB
   between identical frames").
 
-## 7. Limitations
+## 8. Limitations
 
 * Sources with very long GOPs (some screen recorders write a single
   keyframe) make every analysis segment and chunk decode from the nearest
@@ -150,11 +211,14 @@ quality — the price of playing everywhere.
 * 10-bit and HDR inputs are reduced to 8-bit without tone mapping.
 * HEVC/AV1 input depends on the browser having a decoder for it.
 
-## 8. Possible next steps
+## 9. Possible next steps
 
 * Model-based output-size choice (native lower size ≈ 0.6× the bytes of the
   same-size prefilter rung at −0.5…−1.3 dB, consistently across clips).
 * WASM-SIMD versions of x264's hottest C kernels (SATD 8×4, get_ref,
   mc_chroma, SAD 16×16 take ~45% of encode time).
-* AAC audio option for old Apple devices; AV1 output (rav1e) for those who
-  can play it.
+* AAC audio option for old Apple devices.
+* A slower, higher-quality AV1 preset (6); a lower bits-per-pixel
+  threshold for AV1's output size (it uses H.264's 0.03 today).
+* Count histogram bins fractionally at the quantiser threshold, so
+  predicted size is smooth in CRF instead of slightly stepped.

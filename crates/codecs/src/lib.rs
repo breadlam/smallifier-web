@@ -172,3 +172,174 @@ impl Drop for Opus {
         unsafe { so_close(self.raw) }
     }
 }
+
+#[cfg(feature = "av1")]
+pub mod av1 {
+    //! SVT-AV1 (needs real threads: native, or wasm32-wasip1-threads).
+
+    use std::ffi::{CString, c_char, c_int, c_void};
+
+    unsafe extern "C" {
+        fn sv_open(w: c_int, h: c_int, fps_num: c_int, fps_den: c_int, opts: *const c_char, pass: c_int,
+                   stats: *const u8, stats_len: usize) -> *mut c_void;
+        fn sv_header(e: *mut c_void, len: *mut c_int) -> *const u8;
+        fn sv_send(e: *mut c_void, y: *const u8, u: *const u8, v: *const u8, stride_y: c_int, stride_c: c_int,
+                   pts: i64) -> c_int;
+        fn sv_eos(e: *mut c_void) -> c_int;
+        fn sv_receive(e: *mut c_void, block: c_int) -> c_int;
+        fn sv_data(e: *mut c_void) -> *const u8;
+        fn sv_pts(e: *mut c_void) -> i64;
+        fn sv_keyframe(e: *mut c_void) -> c_int;
+        fn sv_stats(e: *mut c_void, len: *mut usize) -> *const u8;
+        fn sv_close(e: *mut c_void);
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct SvtConfig {
+        pub width: u32,
+        pub height: u32,
+        pub fps_num: u32,
+        pub fps_den: u32,
+        /// SVT-AV1 options as "key=value:key=value" (its CLI names).
+        pub opts: String,
+        /// 0 single pass, 1 first pass, 2 second pass.
+        pub pass: u8,
+        /// First-pass statistics, for pass 2.
+        pub stats: Vec<u8>,
+    }
+
+    /// One temporal unit, temporal delimiter removed (as MP4 wants).
+    #[derive(Clone, Debug)]
+    pub struct Packet {
+        pub data: Vec<u8>,
+        pub pts: i64,
+        pub keyframe: bool,
+    }
+
+    pub struct Svt {
+        raw: *mut c_void,
+        out: Vec<Packet>,
+    }
+
+    unsafe impl Send for Svt {}
+
+    impl Svt {
+        pub fn open(cfg: &SvtConfig) -> Result<Self, String> {
+            let opts = CString::new(cfg.opts.as_str()).unwrap();
+            let raw = unsafe {
+                sv_open(cfg.width as c_int, cfg.height as c_int, cfg.fps_num as c_int, cfg.fps_den as c_int,
+                        opts.as_ptr(), cfg.pass as c_int, cfg.stats.as_ptr(), cfg.stats.len())
+            };
+            if raw.is_null() {
+                return Err(format!("SVT-AV1 rejected config {:?}", SvtConfig { stats: vec![], ..cfg.clone() }));
+            }
+            Ok(Svt { raw, out: Vec::new() })
+        }
+
+        /// Sequence header OBU(s).
+        pub fn header(&self) -> Vec<u8> {
+            let mut n = 0;
+            let p = unsafe { sv_header(self.raw, &mut n) };
+            if p.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(p, n as usize) }.to_vec() }
+        }
+
+        fn take(&mut self, n: c_int) {
+            let data = unsafe { std::slice::from_raw_parts(sv_data(self.raw), n as usize) };
+            self.out.push(Packet {
+                data: strip_temporal_delimiters(data),
+                pts: unsafe { sv_pts(self.raw) },
+                keyframe: unsafe { sv_keyframe(self.raw) } != 0,
+            });
+        }
+
+        /// Sends an I420 frame; any packets that are ready are collected.
+        pub fn send(&mut self, y: &[u8], u: &[u8], v: &[u8], stride_y: usize, stride_c: usize, pts: i64)
+                    -> Result<(), String> {
+            let r = unsafe {
+                sv_send(self.raw, y.as_ptr(), u.as_ptr(), v.as_ptr(), stride_y as c_int, stride_c as c_int, pts)
+            };
+            if r < 0 {
+                return Err("SVT-AV1 send failed".into());
+            }
+            // Drain without blocking, or the encoder's output queue can fill
+            // and stall its pipeline.
+            loop {
+                match unsafe { sv_receive(self.raw, 0) } {
+                    n if n > 0 => self.take(n),
+                    0 | -2 => return Ok(()),
+                    _ => return Err("SVT-AV1 receive failed".into()),
+                }
+            }
+        }
+
+        /// Ends the stream and returns all packets in output order.
+        pub fn finish(&mut self) -> Result<Vec<Packet>, String> {
+            if unsafe { sv_eos(self.raw) } < 0 {
+                return Err("SVT-AV1 eos failed".into());
+            }
+            loop {
+                match unsafe { sv_receive(self.raw, 1) } {
+                    n if n > 0 => self.take(n),
+                    -2 => break,
+                    0 => continue,
+                    _ => return Err("SVT-AV1 receive failed".into()),
+                }
+            }
+            Ok(std::mem::take(&mut self.out))
+        }
+
+        /// First-pass statistics (after `finish` on a pass-1 encoder).
+        pub fn stats(&self) -> Vec<u8> {
+            let mut n = 0usize;
+            let p = unsafe { sv_stats(self.raw, &mut n) };
+            if p.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(p, n) }.to_vec() }
+        }
+    }
+
+    impl Drop for Svt {
+        fn drop(&mut self) {
+            unsafe { sv_close(self.raw) }
+        }
+    }
+
+    fn leb128(d: &[u8]) -> Option<(usize, usize)> {
+        let mut v = 0usize;
+        for (i, &b) in d.iter().enumerate().take(8) {
+            v |= ((b & 0x7f) as usize) << (7 * i);
+            if b & 0x80 == 0 {
+                return Some((v, i + 1));
+            }
+        }
+        None
+    }
+
+    /// Drops temporal delimiter OBUs (type 2); MP4 samples must not carry them.
+    pub fn strip_temporal_delimiters(d: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(d.len());
+        let mut p = 0;
+        while p < d.len() {
+            let h = d[p];
+            let typ = (h >> 3) & 0xf;
+            let ext = (h >> 2) & 1;
+            let has_size = (h >> 1) & 1;
+            let hdr = 1 + ext as usize;
+            if has_size == 0 {
+                // Last OBU extends to the end of the unit.
+                if typ != 2 {
+                    out.extend_from_slice(&d[p..]);
+                }
+                break;
+            }
+            let Some((size, n)) = d.get(p + hdr..).and_then(leb128) else {
+                out.extend_from_slice(&d[p..]);
+                break;
+            };
+            let end = (p + hdr + n + size).min(d.len());
+            if typ != 2 {
+                out.extend_from_slice(&d[p..end]);
+            }
+            p = end;
+        }
+        out
+    }
+}

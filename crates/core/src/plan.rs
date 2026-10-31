@@ -16,8 +16,6 @@ use crate::model::{self, ChunkStats, Gain, Model};
 use crate::scene::Chunk;
 use serde::{Deserialize, Serialize};
 
-const CRF_MIN: f64 = 12.0;
-const CRF_MAX: f64 = 51.0;
 const CRF_STEP: f64 = 0.5;
 
 #[derive(Clone, Debug)]
@@ -96,8 +94,8 @@ pub fn allocate(m: &Model, chunks: &[Chunk], stats: &[ChunkStats], rungs: &[Rung
         for (ri, r) in rungs.iter().enumerate() {
             let fixed: Vec<(f64, f64)> =
                 idx.iter().map(|&i| (model::scale_mse(&stats[i], &r.gain), model::residual_energy(&stats[i], &r.gain))).collect();
-            let mut crf = CRF_MIN;
-            while crf <= CRF_MAX + 1e-9 {
+            let mut crf = m.crf_min;
+            while crf <= m.crf_max + 1e-9 {
                 let (mut bytes, mut se) = (0.0, 0.0);
                 for (j, &i) in idx.iter().enumerate() {
                     bytes += model::predict_bytes(m, &stats[i], &r.gain, crf);
@@ -180,6 +178,11 @@ pub struct Controller {
     pub budget: f64,
     pub planned: Vec<f64>,
     pub frames: Vec<usize>,
+    /// The encoder's two-pass bias prior: base + per_frame / frames.
+    pub bias_base: f64,
+    pub bias_per_frame: f64,
+    /// Relative size error of one chunk's second pass (sd).
+    pub chunk_sigma: f64,
     pub state: Vec<State>,
     /// Learned correction on top of `prior_bias`, from finished chunks.
     pub bias: f64,
@@ -195,24 +198,31 @@ pub struct Request {
 
 const PRIOR_WEIGHT: f64 = 2.0;
 
-/// x264's second pass overshoots short chunks: by 2-9% on 2-8 s chunks of
-/// game footage, more on very short ones whose I frame dominates (lab and
-/// browser measurements).
-fn prior_bias(frames: usize) -> f64 {
-    1.03 + 1.5 / frames.max(1) as f64
-}
-/// Relative size error of one two-pass chunk (lab: median ~2%, p90 ~5%).
-const CHUNK_SIGMA: f64 = 0.03;
-
 impl Controller {
-    pub fn new(budget: f64, planned: Vec<f64>, frames: Vec<usize>) -> Self {
+    pub fn new(budget: f64, planned: Vec<f64>, frames: Vec<usize>, model: &Model) -> Self {
         let n = planned.len();
-        Controller { budget, planned, frames, state: vec![State::Pending; n], bias: 1.0, bias_n: 0.0 }
+        Controller {
+            budget,
+            planned,
+            frames,
+            bias_base: model.bias_base,
+            bias_per_frame: model.bias_per_frame,
+            chunk_sigma: model.chunk_sigma,
+            state: vec![State::Pending; n],
+            bias: 1.0,
+            bias_n: 0.0,
+        }
+    }
+
+    /// Prior actual/requested ratio of a two-pass chunk of `frames` frames
+    /// (x264 overshoots short chunks, whose I frame dominates).
+    fn prior_bias(&self, frames: usize) -> f64 {
+        self.bias_base + self.bias_per_frame / frames.max(1) as f64
     }
 
     /// Expected actual/requested ratio for chunk i's second pass.
     pub fn expected_ratio(&self, i: usize) -> f64 {
-        prior_bias(self.frames[i]) * self.bias
+        self.prior_bias(self.frames[i]) * self.bias
     }
 
     /// Next chunk to start (largest planned first: long jobs first keeps
@@ -229,7 +239,7 @@ impl Controller {
     /// known now. The remaining budget is shared among the chunks without a
     /// target yet in proportion to their planned sizes, after holding back
     /// one sigma of the size uncertainty of everything not finished (each
-    /// two-pass chunk lands within ~3%, independently). Early chunks thus
+    /// two-pass chunk lands within `chunk_sigma`, independently). Early chunks thus
     /// keep a cushion and the last ones get exactly what is left.
     pub fn second_pass_target(&mut self, i: usize) -> f64 {
         let mut committed = 0.0; // done (actual) + running second passes (expected)
@@ -241,11 +251,11 @@ impl Controller {
                 State::SecondPass { requested } => {
                     let e = requested * self.expected_ratio(j);
                     committed += e;
-                    var += (CHUNK_SIGMA * e).powi(2);
+                    var += (self.chunk_sigma * e).powi(2);
                 }
                 _ => {
                     open += self.planned[j];
-                    var += (CHUNK_SIGMA * self.planned[j]).powi(2);
+                    var += (self.chunk_sigma * self.planned[j]).powi(2);
                 }
             }
         }
@@ -265,7 +275,7 @@ impl Controller {
         };
         self.state[i] = State::Done { requested, actual };
         // Learn how far off the prior is, shrunk towards "not at all".
-        let r = (actual / requested.max(1.0) / prior_bias(self.frames[i])).clamp(0.7, 1.5);
+        let r = (actual / requested.max(1.0) / self.prior_bias(self.frames[i])).clamp(0.7, 1.5);
         self.bias = (self.bias * (PRIOR_WEIGHT + self.bias_n) + r) / (PRIOR_WEIGHT + self.bias_n + 1.0);
         self.bias_n += 1.0;
     }
@@ -333,7 +343,7 @@ mod tests {
 
     #[test]
     fn controller_fills_budget() {
-        let mut c = Controller::new(1000.0, vec![400.0, 300.0, 300.0], vec![200, 150, 150]);
+        let mut c = Controller::new(1000.0, vec![400.0, 300.0, 300.0], vec![200, 150, 150], &model::MEDIUM);
         let a = c.next_chunk().unwrap();
         assert_eq!(a, 0);
         let t = c.second_pass_target(a);
@@ -350,7 +360,7 @@ mod tests {
 
     #[test]
     fn fixups_cut_overshoot() {
-        let mut c = Controller::new(1000.0, vec![500.0, 500.0], vec![100, 100]);
+        let mut c = Controller::new(1000.0, vec![500.0, 500.0], vec![100, 100], &model::MEDIUM);
         for _ in 0..2 {
             let i = c.next_chunk().unwrap();
             c.second_pass_target(i);

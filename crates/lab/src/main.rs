@@ -7,6 +7,9 @@
 //!   lab twopass <clip> <WxH> <kbps1> [kbps2]
 //!   lab parity <lab.json> <preset>       Rust model predictions (vs tools/fit_model.py)
 //!   lab scalecheck <clip>                our Lanczos vs ffmpeg's
+//!   lab av1 <clip> <WxH> <kbps> <preset> [frames] [extra opts]   SVT-AV1 two-pass check
+//!   lab av1rc <clip> <lab.json> <preset>  SVT-AV1 two-pass size accuracy per chunk
+//!   (gen with --preset svtN makes SVT-AV1 preset N ground truth)
 //!   lab gen <clip> <WxH> <fps> <out.json> [--crfs 18,24,...] [--verify]
 //!           [--preset P] [--rc-experiments]   (also 1-pass ABR and 2-pass per chunk)
 //!           [--ref WxH]   measure quality against the source at WxH (decode upscaled)
@@ -143,10 +146,16 @@ fn encode_chunk(frames: &[Frame], cfg: &X264Config, keep: bool) -> EncodeOut {
 /// pixel luma MSE against `reference`, upscaling the decode (our Lanczos)
 /// when the reference is larger, so different output sizes are comparable.
 fn true_luma_mse(annexb: &[u8], reference: &[Frame], w: usize, h: usize) -> f64 {
+    true_luma_mse_fmt(annexb, "h264", reference, w, h)
+}
+
+/// `fmt` is the ffmpeg demuxer for `stream` ("h264" or "ivf").
+fn true_luma_mse_fmt(stream: &[u8], fmt: &str, reference: &[Frame], w: usize, h: usize) -> f64 {
+    let annexb = stream;
     let (rw, rh) = (reference[0].y.w, reference[0].y.h);
     let up = ((rw, rh) != (w, h)).then(|| smallifier_core::yuv::Scaler::new(w, h, rw, rh));
     let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-f", "h264", "-i", "-", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+        .args(["-v", "error", "-nostdin", "-f", fmt, "-i", "-", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -257,12 +266,23 @@ fn generate(clip: &str, w: usize, h: usize, fps: u32, out_path: &str, crfs: &[f6
         let (ci, ri) = pairs[pi];
         let (ref filt, scale_mse) = filtered[pi];
         let src = &refs[chunks[ci].start..chunks[ci].end];
-        let e = encode_chunk(filt, &x264_cfg(w, h, fps, preset, &format!("crf={crf}"), true), verify);
-        let true_mse = if verify { true_luma_mse(&e.annexb, src, w, h) } else { -1.0 };
+        // "svtN" presets are SVT-AV1 preset N; anything else is x264.
+        let (bytes, psnr_enc, stream, fmt) = match preset.strip_prefix("svt") {
+            Some(p) => {
+                let o = av1_encode(filt, fps, &svt_opts(p.parse().unwrap(), &format!("crf={crf}")), 0, Vec::new());
+                let ivf = if verify { ivf_bytes(w, h, fps, &o.packets) } else { Vec::new() };
+                (o.bytes, 0.0, ivf, "ivf")
+            }
+            None => {
+                let e = encode_chunk(filt, &x264_cfg(w, h, fps, preset, &format!("crf={crf}"), true), verify);
+                (e.bytes, e.psnr_x264, e.annexb, "h264")
+            }
+        };
+        let true_mse = if verify { true_luma_mse_fmt(&stream, fmt, src, w, h) } else { -1.0 };
         (format!(
             "{{\"chunk\":{ci},\"rung\":{ri},\"crf\":{crf},\"bytes\":{},\"psnr_x264\":{:.4},\"scale_mse\":{:.5},\"true_mse\":{:.5}}}",
-            e.bytes, e.psnr_x264, scale_mse, true_mse
-        ), e.bytes, true_mse)
+            bytes, psnr_enc, scale_mse, true_mse
+        ), bytes, true_mse)
     });
     let stats_dir = format!("{out_path}.stats");
     std::fs::create_dir_all(&stats_dir).unwrap();
@@ -343,7 +363,8 @@ fn generate(clip: &str, w: usize, h: usize, fps: u32, out_path: &str, crfs: &[f6
     let rows: Vec<String> = results.into_iter().flatten().collect();
     let json = format!(
         "{{\"clip\":\"{clip}\",\"w\":{w},\"h\":{h},\"fps\":{fps},\"preset\":\"{preset}\",\"opts\":\"{}\",\"rungs\":[{}],\"chunks\":[{}],\"results\":[{}],\"abr\":[{}]}}",
-        x264_opts(preset), gains.join(","), chunk_json.join(","), rows.join(","), abr_out.join(",")
+        match preset.strip_prefix("svt") { Some(p) => svt_opts(p.parse().unwrap(), "crf=N"), None => x264_opts(preset) },
+        gains.join(","), chunk_json.join(","), rows.join(","), abr_out.join(",")
     );
     std::fs::write(out_path, json).unwrap();
     eprintln!("wrote {out_path} in {:.1}s total", t0.elapsed().as_secs_f64());
@@ -494,8 +515,7 @@ fn muxtest(clip: &str, out: &str) {
         height: h as u32,
         fps_num: fps,
         fps_den: 1,
-        sps: &sps,
-        pps: &pps,
+        codec: mux::VideoCodec::H264 { sps: &sps, pps: &pps },
         rotation: 0,
         samples: packets.iter().map(|p| mux::VSample { data: &p.data, pts: p.pts, keyframe: p.keyframe }).collect(),
     };
@@ -545,7 +565,63 @@ fn parity(path: &str, preset: &str) {
         let crf = r["crf"].as_f64().unwrap();
         println!("{} {} {} {:.1} {:.4}", r["chunk"], r["rung"], crf, model::predict_bytes(m, c, g, crf),
                  model::psnr(model::predict_mse(m, c, g, crf)));
+        if std::env::var("PARITY_TERMS").is_ok_and(|v| v.parse::<f64>().ok() == Some(crf)) {
+            eprintln!("terms {} {}: {:?}", r["chunk"], r["rung"], model::predict_terms(m, c, g, crf).map(|t| (t / 8.0).round()));
+        }
     }
+}
+
+use smallifier_core::model::svt_opts;
+
+pub struct Av1Out {
+    pub bytes: usize,
+    pub header: Vec<u8>,
+    pub packets: Vec<codecs::av1::Packet>,
+    pub stats: Vec<u8>,
+    /// Copy of the first-pass stats (for a second use).
+    pub stats_for_reuse: Vec<u8>,
+    pub secs: f64,
+}
+
+pub fn av1_encode(frames: &[Frame], fps: u32, opts: &str, pass: u8, stats: Vec<u8>) -> Av1Out {
+    use codecs::av1::{Svt, SvtConfig};
+    let (w, h) = (frames[0].y.w, frames[0].y.h);
+    let t = Instant::now();
+    let mut e = Svt::open(&SvtConfig { width: w as u32, height: h as u32, fps_num: fps, fps_den: 1, opts: opts.into(), pass, stats })
+        .unwrap();
+    for (i, f) in frames.iter().enumerate() {
+        e.send(&f.y.data, &f.u.data, &f.v.data, f.y.w, f.u.w, i as i64).unwrap();
+    }
+    let packets = e.finish().unwrap();
+    let stats = if pass == 1 { e.stats() } else { Vec::new() };
+    Av1Out { bytes: packets.iter().map(|p| p.data.len()).sum(), header: e.header(), packets, stats_for_reuse: stats.clone(), stats,
+             secs: t.elapsed().as_secs_f64() }
+}
+
+/// IVF file (temporal delimiters put back) for checking with ffmpeg.
+pub fn write_ivf(path: &str, w: usize, h: usize, fps: u32, packets: &[codecs::av1::Packet]) {
+    std::fs::write(path, ivf_bytes(w, h, fps, packets)).unwrap();
+}
+
+pub fn ivf_bytes(w: usize, h: usize, fps: u32, packets: &[codecs::av1::Packet]) -> Vec<u8> {
+    let mut o = Vec::new();
+    o.extend_from_slice(b"DKIF");
+    o.extend_from_slice(&0u16.to_le_bytes());
+    o.extend_from_slice(&32u16.to_le_bytes());
+    o.extend_from_slice(b"AV01");
+    o.extend_from_slice(&(w as u16).to_le_bytes());
+    o.extend_from_slice(&(h as u16).to_le_bytes());
+    o.extend_from_slice(&fps.to_le_bytes());
+    o.extend_from_slice(&1u32.to_le_bytes());
+    o.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+    o.extend_from_slice(&0u32.to_le_bytes());
+    for p in packets {
+        o.extend_from_slice(&(p.data.len() as u32 + 2).to_le_bytes());
+        o.extend_from_slice(&(p.pts as u64).to_le_bytes());
+        o.extend_from_slice(&[0x12, 0x00]);
+        o.extend_from_slice(&p.data);
+    }
+    o
 }
 
 fn parse_wh(s: &str) -> (usize, usize) {
@@ -561,6 +637,60 @@ fn main() {
             speed(&args[2], w, h, args.get(4).map(|v| v.parse().unwrap()).unwrap_or(120));
         }
         Some("muxtest") => muxtest(&args[2], &args[3]),
+        Some("av1rc") => {
+            // lab av1rc <clip> <lab.json> <preset> -- per-chunk two-pass VBR accuracy at the
+            // sizes x264 reached at CRF 28 and 36 (rung 3) in a lab file of the same clip.
+            let d: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&args[3]).unwrap()).unwrap();
+            let (w, h) = (d["w"].as_u64().unwrap() as usize, d["h"].as_u64().unwrap() as usize);
+            let preset: u32 = args[4].parse().unwrap();
+            let frames = load_frames(&args[2], 30, w, h, usize::MAX);
+            let chunks: Vec<(usize, usize)> = d["chunks"].as_array().unwrap().iter()
+                .map(|c| (c["start"].as_u64().unwrap() as usize, c["end"].as_u64().unwrap() as usize)).collect();
+            let mut jobs = Vec::new();
+            for r in d["results"].as_array().unwrap() {
+                let crf = r["crf"].as_f64().unwrap();
+                if r["rung"].as_u64() == Some(3) && (crf == 28.0 || crf == 36.0) {
+                    for gc in [false, true] {
+                        jobs.push((r["chunk"].as_u64().unwrap() as usize, r["bytes"].as_f64().unwrap(), crf, gc));
+                    }
+                }
+            }
+            let rows = par_map(jobs, |(ci, bytes, crf, gc)| {
+                let (a, b) = chunks[ci];
+                let secs = (b - a) as f64 / 30.0;
+                let rc = format!("rc=1:tbr={}b{}", (bytes * 8.0 / secs) as u64, if gc { ":gop-constraint-rc=1" } else { "" });
+                let p1 = av1_encode(&frames[a..b], 30, &svt_opts(preset, &rc), 1, Vec::new());
+                let p2 = av1_encode(&frames[a..b], 30, &svt_opts(preset, &rc), 2, p1.stats);
+                // And the response to asking for 10% less, reusing the stats.
+                let rc2 = format!("rc=1:tbr={}b{}", (0.9 * bytes * 8.0 / secs) as u64, if gc { ":gop-constraint-rc=1" } else { "" });
+                let p3 = av1_encode(&frames[a..b], 30, &svt_opts(preset, &rc2), 2, p1.stats_for_reuse.clone());
+                format!("{ci} {} {crf} {gc} {bytes:.0} {} {} {:.2} {:.2}", b - a, p2.bytes, p3.bytes, p1.secs, p2.secs)
+            });
+            for r in rows {
+                println!("{r}");
+            }
+        }
+        Some("av1") => {
+            // lab av1 <clip> <WxH> <kbps> <preset> [frames]
+            let (w, h) = parse_wh(&args[3]);
+            let kbps: f64 = args[4].parse().unwrap();
+            let preset: u32 = args[5].parse().unwrap();
+            let n = args.get(6).map(|v| v.parse().unwrap()).unwrap_or(120);
+            let extra = args.get(7).cloned().unwrap_or_default();
+            let frames = load_frames(&args[2], 30, w, h, n);
+            let rc = format!("rc=1:tbr={}b{extra}", (kbps * 1000.0) as u64);
+            let p1 = av1_encode(&frames, 30, &svt_opts(preset, &rc), 1, Vec::new());
+            let p2 = av1_encode(&frames, 30, &svt_opts(preset, &rc), 2, p1.stats.clone());
+            let target = kbps * 1000.0 / 8.0 * frames.len() as f64 / 30.0;
+            println!("preset {preset}: pass1 {:.1} fps ({} B stats), pass2 {:.1} fps; {} packets, {} bytes vs target {:.0} ({:+.1}%), keyframes {}, header {} B",
+                     frames.len() as f64 / p1.secs, p1.stats.len(), frames.len() as f64 / p2.secs, p2.packets.len(), p2.bytes, target,
+                     (p2.bytes as f64 / target - 1.0) * 100.0, p2.packets.iter().filter(|p| p.keyframe).count(), p2.header.len());
+            let pts: Vec<i64> = p2.packets.iter().map(|p| p.pts).collect();
+            println!("pts monotonic: {}", pts.windows(2).all(|w| w[1] > w[0]));
+            let path = std::env::temp_dir().join("smallifier-av1.ivf");
+            write_ivf(path.to_str().unwrap(), w, h, 30, &p2.packets);
+            println!("wrote {}", path.display());
+        }
         Some("parity") => parity(&args[2], &args[3]),
         Some("scalecheck") => {
             // Our 1080p->720p Lanczos versus ffmpeg's, on real frames.
