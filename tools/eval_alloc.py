@@ -131,9 +131,9 @@ def main():
             pred_h.append(hull(pp))
         total_frames = sum(scene_frames)
         name = path.split("/")[-1].replace(".json", "")
-        # Budgets: what three uniform CRFs at full res would cost (low, middle
-        # and high in this file's CRF grid).
-        for ref_crf in (crfs[1], crfs[len(crfs) // 2], crfs[-3]):
+        # Budgets: what uniform CRFs at full res would cost, from generous to
+        # tight in this file's CRF grid.
+        for ref_crf in sorted({crfs[1], crfs[len(crfs) // 2], crfs[-3], crfs[-2]}):
             budget = sum(r["bytes"] for r in rows if r["rung"] == nr - 1 and r["crf"] == ref_crf)
             oc, _ = allocate(meas_h, budget)
             q_oracle = sum(meas_h[s][oc[s]][1] for s in range(len(scenes))) / total_frames

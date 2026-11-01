@@ -9,10 +9,12 @@
 //!   lab scalecheck <clip>                our Lanczos vs ffmpeg's
 //!   lab av1 <clip> <WxH> <kbps> <preset> [frames] [extra opts]   SVT-AV1 two-pass check
 //!   lab av1rc <clip> <lab.json> <preset>  SVT-AV1 two-pass size accuracy per chunk
+//!   lab svtsurvey <clip> <WxH> <frames> <presets> <depths> <crfs> <out.jsonl>   preset/bit-depth comparison
 //!   (gen with --preset svtN makes SVT-AV1 preset N ground truth)
 //!   lab gen <clip> <WxH> <fps> <out.json> [--crfs 18,24,...] [--verify]
 //!           [--preset P] [--rc-experiments]   (also 1-pass ABR and 2-pass per chunk)
 //!           [--ref WxH]   measure quality against the source at WxH (decode upscaled)
+//!           [--rungs 0.6,1.0]   prefilter rungs (fractions of WxH; default 0.5,0.6,0.75,1.0)
 
 use codecs::{X264, X264Config};
 use smallifier_core::analysis::{Analyzer, FrameStats, Thumb};
@@ -66,7 +68,14 @@ fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R>
     let items: Vec<Mutex<Option<T>>> = items.into_iter().map(|t| Mutex::new(Some(t))).collect();
     let results: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4).min(n.max(1));
+    // LAB_THREADS caps the pool, for running several lab processes at once
+    // (SVT-AV1 keeps per-preset block geometry in globals, so encoders with
+    // different presets must not share a process).
+    let threads = std::env::var("LAB_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4))
+        .min(n.max(1));
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
@@ -151,6 +160,15 @@ fn true_luma_mse(annexb: &[u8], reference: &[Frame], w: usize, h: usize) -> f64 
 
 /// `fmt` is the ffmpeg demuxer for `stream` ("h264" or "ivf").
 fn true_luma_mse_fmt(stream: &[u8], fmt: &str, reference: &[Frame], w: usize, h: usize) -> f64 {
+    true_luma_mse_depth(stream, fmt, reference, w, h, 8)
+}
+
+/// As `true_luma_mse_fmt`, for a stream of `depth`-bit video: a 10-bit
+/// decode is compared at full precision (in 8-bit units, sample / 4).
+fn true_luma_mse_depth(stream: &[u8], fmt: &str, reference: &[Frame], w: usize, h: usize, depth: u32) -> f64 {
+    if depth > 8 {
+        return true_luma_mse_10(stream, fmt, reference, w, h);
+    }
     let annexb = stream;
     let (rw, rh) = (reference[0].y.w, reference[0].y.h);
     let up = ((rw, rh) != (w, h)).then(|| smallifier_core::yuv::Scaler::new(w, h, rw, rh));
@@ -188,12 +206,44 @@ fn true_luma_mse_fmt(stream: &[u8], fmt: &str, reference: &[Frame], w: usize, h:
     se / (n * rw * rh) as f64
 }
 
+fn true_luma_mse_10(stream: &[u8], fmt: &str, reference: &[Frame], w: usize, h: usize) -> f64 {
+    assert!((reference[0].y.w, reference[0].y.h) == (w, h), "10-bit check needs a same-size reference");
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-f", fmt, "-i", "-", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let data = stream.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&data);
+    });
+    let mut out = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    writer.join().unwrap();
+    child.wait().unwrap();
+    let fsize = (w * h + 2 * w.div_ceil(2) * h.div_ceil(2)) * 2;
+    let n = (out.len() / fsize).min(reference.len());
+    assert!(n == reference.len(), "decoded {n} of {} frames", reference.len());
+    let mut se = 0f64;
+    for (i, r) in reference.iter().enumerate() {
+        let y = &out[i * fsize..i * fsize + w * h * 2];
+        se += y
+            .chunks_exact(2)
+            .zip(&r.y.data)
+            .map(|(a, b)| (u16::from_le_bytes([a[0], a[1]]) as f64 / 4.0 - *b as f64).powi(2))
+            .sum::<f64>();
+    }
+    se / (n * w * h) as f64
+}
+
 fn luma_mse(a: &Frame, b: &Frame) -> f64 {
     a.y.data.iter().zip(&b.y.data).map(|(x, y)| (*x as f64 - *y as f64).powi(2)).sum::<f64>() / a.y.data.len() as f64
 }
 
-fn rungs_for(w: usize, h: usize) -> Vec<(usize, usize)> {
-    [0.5, 0.6, 0.75, 1.0]
+fn rungs_for(w: usize, h: usize, factors: &[f64]) -> Vec<(usize, usize)> {
+    factors
         .iter()
         .map(|f| (((w as f64 * f / 2.0).round() * 2.0) as usize, ((h as f64 * f / 2.0).round() * 2.0) as usize))
         .collect()
@@ -214,8 +264,9 @@ fn hist_json(v: &[u32]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate(clip: &str, w: usize, h: usize, fps: u32, out_path: &str, crfs: &[f64], verify: bool, preset: &str,
-            rc_experiments: bool, ref_wh: Option<(usize, usize)>) {
+            rc_experiments: bool, ref_wh: Option<(usize, usize)>, rung_factors: &[f64]) {
     let t0 = Instant::now();
     let frames = load_frames(clip, fps, w, h, usize::MAX);
     // Quality is measured against `refs` (the source at the reference size).
@@ -242,7 +293,7 @@ fn generate(clip: &str, w: usize, h: usize, fps: u32, out_path: &str, crfs: &[f6
     eprintln!("analysis {:.1}s ({:.1} ms/frame/thread)", t1.elapsed().as_secs_f64(),
               t1.elapsed().as_secs_f64() * 1000.0 * 256.0 / frames.len() as f64);
 
-    let rungs = rungs_for(w, h);
+    let rungs = rungs_for(w, h, rung_factors);
     // Encode jobs grouped by (chunk, rung) so the prefilter runs once.
     // Prefilter once per (chunk, rung), then fan out one job per CRF.
     let t2 = Instant::now();
@@ -267,18 +318,19 @@ fn generate(clip: &str, w: usize, h: usize, fps: u32, out_path: &str, crfs: &[f6
         let (ref filt, scale_mse) = filtered[pi];
         let src = &refs[chunks[ci].start..chunks[ci].end];
         // "svtN" presets are SVT-AV1 preset N; anything else is x264.
-        let (bytes, psnr_enc, stream, fmt) = match preset.strip_prefix("svt") {
-            Some(p) => {
-                let o = av1_encode(filt, fps, &svt_opts(p.parse().unwrap(), &format!("crf={crf}")), 0, Vec::new());
+        let (bytes, psnr_enc, stream, fmt, depth) = match smallifier_core::model::svt_preset(preset) {
+            Some((p, depth)) => {
+                let o = av1_encode(filt, fps, &svt_opts(p, depth, &format!("crf={crf}:measure=1")), 0, Vec::new());
                 let ivf = if verify { ivf_bytes(w, h, fps, &o.packets) } else { Vec::new() };
-                (o.bytes, 0.0, ivf, "ivf")
+                let mse = o.sse / (filt.len() * w * h) as f64;
+                (o.bytes, 10.0 * (65025.0 / mse).log10(), ivf, "ivf", depth)
             }
             None => {
                 let e = encode_chunk(filt, &x264_cfg(w, h, fps, preset, &format!("crf={crf}"), true), verify);
-                (e.bytes, e.psnr_x264, e.annexb, "h264")
+                (e.bytes, e.psnr_x264, e.annexb, "h264", 8)
             }
         };
-        let true_mse = if verify { true_luma_mse_fmt(&stream, fmt, src, w, h) } else { -1.0 };
+        let true_mse = if verify { true_luma_mse_depth(&stream, fmt, src, w, h, depth) } else { -1.0 };
         (format!(
             "{{\"chunk\":{ci},\"rung\":{ri},\"crf\":{crf},\"bytes\":{},\"psnr_x264\":{:.4},\"scale_mse\":{:.5},\"true_mse\":{:.5}}}",
             bytes, psnr_enc, scale_mse, true_mse
@@ -363,7 +415,7 @@ fn generate(clip: &str, w: usize, h: usize, fps: u32, out_path: &str, crfs: &[f6
     let rows: Vec<String> = results.into_iter().flatten().collect();
     let json = format!(
         "{{\"clip\":\"{clip}\",\"w\":{w},\"h\":{h},\"fps\":{fps},\"preset\":\"{preset}\",\"opts\":\"{}\",\"rungs\":[{}],\"chunks\":[{}],\"results\":[{}],\"abr\":[{}]}}",
-        match preset.strip_prefix("svt") { Some(p) => svt_opts(p.parse().unwrap(), "crf=N"), None => x264_opts(preset) },
+        match smallifier_core::model::svt_preset(preset) { Some((p, d)) => svt_opts(p, d, "crf=N"), None => x264_opts(preset) },
         gains.join(","), chunk_json.join(","), rows.join(","), abr_out.join(",")
     );
     std::fs::write(out_path, json).unwrap();
@@ -539,7 +591,7 @@ fn parity(path: &str, preset: &str) {
     use smallifier_core::model::{self, ChunkStats, Gain};
     let d: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let (w, h) = (d["w"].as_u64().unwrap() as usize, d["h"].as_u64().unwrap() as usize);
-    let m = model::model_for(preset);
+    let m = model::model_for(preset).expect("no model for this preset");
     let hist = |v: &serde_json::Value| -> Vec<u32> { v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect() };
     let chunks: Vec<ChunkStats> = d["chunks"].as_array().unwrap().iter().map(|c| {
         let frames = (c["end"].as_u64().unwrap() - c["start"].as_u64().unwrap()) as u32;
@@ -575,6 +627,8 @@ use smallifier_core::model::svt_opts;
 
 pub struct Av1Out {
     pub bytes: usize,
+    /// Luma SSE reported by SVT-AV1 (with "measure=1").
+    pub sse: f64,
     pub header: Vec<u8>,
     pub packets: Vec<codecs::av1::Packet>,
     pub stats: Vec<u8>,
@@ -594,7 +648,7 @@ pub fn av1_encode(frames: &[Frame], fps: u32, opts: &str, pass: u8, stats: Vec<u
     }
     let packets = e.finish().unwrap();
     let stats = if pass == 1 { e.stats() } else { Vec::new() };
-    Av1Out { bytes: packets.iter().map(|p| p.data.len()).sum(), header: e.header(), packets, stats_for_reuse: stats.clone(), stats,
+    Av1Out { bytes: packets.iter().map(|p| p.data.len()).sum(), sse: e.sse(), header: e.header(), packets, stats_for_reuse: stats.clone(), stats,
              secs: t.elapsed().as_secs_f64() }
 }
 
@@ -659,11 +713,11 @@ fn main() {
                 let (a, b) = chunks[ci];
                 let secs = (b - a) as f64 / 30.0;
                 let rc = format!("rc=1:tbr={}b{}", (bytes * 8.0 / secs) as u64, if gc { ":gop-constraint-rc=1" } else { "" });
-                let p1 = av1_encode(&frames[a..b], 30, &svt_opts(preset, &rc), 1, Vec::new());
-                let p2 = av1_encode(&frames[a..b], 30, &svt_opts(preset, &rc), 2, p1.stats);
+                let p1 = av1_encode(&frames[a..b], 30, &svt_opts(preset, 8, &rc), 1, Vec::new());
+                let p2 = av1_encode(&frames[a..b], 30, &svt_opts(preset, 8, &rc), 2, p1.stats);
                 // And the response to asking for 10% less, reusing the stats.
                 let rc2 = format!("rc=1:tbr={}b{}", (0.9 * bytes * 8.0 / secs) as u64, if gc { ":gop-constraint-rc=1" } else { "" });
-                let p3 = av1_encode(&frames[a..b], 30, &svt_opts(preset, &rc2), 2, p1.stats_for_reuse.clone());
+                let p3 = av1_encode(&frames[a..b], 30, &svt_opts(preset, 8, &rc2), 2, p1.stats_for_reuse.clone());
                 format!("{ci} {} {crf} {gc} {bytes:.0} {} {} {:.2} {:.2}", b - a, p2.bytes, p3.bytes, p1.secs, p2.secs)
             });
             for r in rows {
@@ -679,17 +733,51 @@ fn main() {
             let extra = args.get(7).cloned().unwrap_or_default();
             let frames = load_frames(&args[2], 30, w, h, n);
             let rc = format!("rc=1:tbr={}b{extra}", (kbps * 1000.0) as u64);
-            let p1 = av1_encode(&frames, 30, &svt_opts(preset, &rc), 1, Vec::new());
-            let p2 = av1_encode(&frames, 30, &svt_opts(preset, &rc), 2, p1.stats.clone());
+            let p1 = av1_encode(&frames, 30, &svt_opts(preset, 8, &rc), 1, Vec::new());
+            let p2 = av1_encode(&frames, 30, &svt_opts(preset, 8, &rc), 2, p1.stats.clone());
             let target = kbps * 1000.0 / 8.0 * frames.len() as f64 / 30.0;
             println!("preset {preset}: pass1 {:.1} fps ({} B stats), pass2 {:.1} fps; {} packets, {} bytes vs target {:.0} ({:+.1}%), keyframes {}, header {} B",
                      frames.len() as f64 / p1.secs, p1.stats.len(), frames.len() as f64 / p2.secs, p2.packets.len(), p2.bytes, target,
                      (p2.bytes as f64 / target - 1.0) * 100.0, p2.packets.iter().filter(|p| p.keyframe).count(), p2.header.len());
+            println!("header {}", p2.header.iter().map(|b| format!("{b:02x}")).collect::<String>());
             let pts: Vec<i64> = p2.packets.iter().map(|p| p.pts).collect();
             println!("pts monotonic: {}", pts.windows(2).all(|w| w[1] > w[0]));
             let path = std::env::temp_dir().join("smallifier-av1.ivf");
             write_ivf(path.to_str().unwrap(), w, h, 30, &p2.packets);
             println!("wrote {}", path.display());
+        }
+        Some("svtsurvey") => {
+            // lab svtsurvey <clip> <WxH> <frames> <presets> <depths> <crfs> <out.jsonl>
+            // Size, true luma MSE, SVT-AV1's own SSE and time per 8 s chunk, for
+            // comparing presets and bit depths.
+            let (w, h) = parse_wh(&args[3]);
+            let n: usize = args[4].parse().unwrap();
+            let list = |a: &str| a.split(',').map(|v| v.parse::<u32>().unwrap()).collect::<Vec<_>>();
+            let (presets, depths, crfs) = (list(&args[5]), list(&args[6]), list(&args[7]));
+            let frames = load_frames(&args[2], 30, w, h, n);
+            let chunks: Vec<(usize, usize)> = (0..frames.len()).step_by(240).map(|a| (a, (a + 240).min(frames.len()))).collect();
+            let mut jobs = Vec::new();
+            for &p in &presets {
+                for &d in &depths {
+                    for &c in &crfs {
+                        for (ci, &ch) in chunks.iter().enumerate() {
+                            jobs.push((p, d, c, ci, ch));
+                        }
+                    }
+                }
+            }
+            // Slowest first so the tail is short.
+            jobs.sort_by_key(|j| (j.0, std::cmp::Reverse(j.1)));
+            let clip = args[2].clone();
+            let rows = par_map(jobs, |(p, d, c, ci, (a, b))| {
+                let o = av1_encode(&frames[a..b], 30, &svt_opts(p, d, &format!("crf={c}:measure=1")), 0, Vec::new());
+                let ivf = ivf_bytes(w, h, 30, &o.packets);
+                let mse = true_luma_mse_depth(&ivf, "ivf", &frames[a..b], w, h, d);
+                let svt_mse = o.sse / ((b - a) * w * h) as f64;
+                format!("{{\"clip\":\"{clip}\",\"w\":{w},\"h\":{h},\"preset\":{p},\"depth\":{d},\"crf\":{c},\"chunk\":{ci},\"frames\":{},\"bytes\":{},\"mse\":{mse:.5},\"svt_mse\":{svt_mse:.5},\"secs\":{:.3}}}",
+                        b - a, o.bytes, o.secs)
+            });
+            std::fs::write(&args[8], rows.join("\n") + "\n").unwrap();
         }
         Some("parity") => parity(&args[2], &args[3]),
         Some("scalecheck") => {
@@ -747,6 +835,7 @@ fn main() {
             let mut rc_experiments = false;
             let mut ref_wh = None;
             let mut preset = smallifier_core::model::X264_PRESET.to_string();
+            let mut rung_factors = vec![0.5, 0.6, 0.75, 1.0];
             let mut i = 6;
             while i < args.len() {
                 match args[i].as_str() {
@@ -764,11 +853,15 @@ fn main() {
                         preset = args[i + 1].clone();
                         i += 1;
                     }
+                    "--rungs" => {
+                        rung_factors = args[i + 1].split(',').map(|v| v.parse().unwrap()).collect();
+                        i += 1;
+                    }
                     a => panic!("unknown arg {a}"),
                 }
                 i += 1;
             }
-            generate(&args[2], w, h, fps, &args[5], &crfs, verify, &preset, rc_experiments, ref_wh);
+            generate(&args[2], w, h, fps, &args[5], &crfs, verify, &preset, rc_experiments, ref_wh, &rung_factors);
         }
         _ => eprintln!("usage: lab speed <clip> <WxH> [frames] | lab gen <clip> <WxH> <fps> <out.json> [--crfs a,b] [--verify]"),
     }

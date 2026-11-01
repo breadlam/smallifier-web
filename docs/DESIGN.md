@@ -186,7 +186,107 @@ its target; predicted PSNR within ~0.2 dB of measured (GTA V: 36.36 vs
 ~2.5 fps (720p) / 0.5 fps (1080p) per worker at preset 8, so 1080p
 output is slow.
 
-## 7. Things found along the way
+## 7. Effort levels
+
+smallifier.py spends its time on SVT-AV1 preset 2 at 10 bits, measuring
+every candidate. The app first offered only x264 medium/veryfast and
+SVT-AV1 preset 8, which left a lot on the table at aggressive targets (a
+24-minute 1440p60 recording into 20 MB is ~85 kbps of video). The *Effort*
+setting now goes down to the original's encoder speed; every level is a
+separate preset with its own fitted model, so slow levels are planned as
+accurately as the default.
+
+**Which presets, and 10-bit or not.** `lab svtsurvey`
+(`tools/svt_survey.py`): 3 chunks × 4 clips at 540p, 5 CRFs, presets 2–10 ×
+8/10-bit, true PSNR from decoded output. BD-rate against preset 8, 8-bit:
+
+| SVT-AV1 | 8-bit | 10-bit | native time, 8 / 10-bit |
+|---|---|---|---|
+| preset 10 | +52% | +45% | 0.47× / 0.46× |
+| preset 6 | −11.6% | −12.1% | 1.6× / 1.8× |
+| preset 5 | −18.3% | −19.2% | 2.0× / 2.5× |
+| preset 4 | −23.8% | −24.6% | 2.6× / 3.2× |
+| preset 3 (3 chunks) | −32% | −33% | 2.7× / 3.9× |
+
+10-bit buys 0.5–1% for 15–45% more time (more in wasm), so the levels are
+8-bit; the shim can still encode 10-bit (`svtN-10`, input widened from the
+8-bit frames; av1C's bit-depth flags come from parsing the sequence header).
+Preset 10 is not worth offering.
+
+**Models.** SVT-AV1 presets 6/5/4/3/2 were fitted on a reduced lab design
+(5 clip/size sets: GTA V, DOTA 2, CS:GO at 540p, StarCraft 2 at 720p, DOTA 2
+at 360p; prefilter rungs 0.6 and 1.0; CRF 24/34/44/53/62; ~470 encodes
+each). x264 slower and veryslow use the full medium design (veryslow
+without CS:GO 1080p). Fit quality is like the existing presets' (all, like
+medium, over-predict 60 fps sets by ~25% as a whole, which two-pass
+absorbs):
+
+| preset | size error per chunk, median / p90 | PSNR error, median / p90 |
+|---|---|---|
+| SVT-AV1 6 / 5 / 4 / 3 / 2 | 12.6–13.4% / 36–38% | 0.29–0.32 / 1.02–1.09 dB |
+| x264 slower / veryslow | 16.2% / 42% · 16.7% / 40% | 0.40 / 1.32 · 0.39 / 1.34 dB |
+| (for comparison) x264 medium, SVT-AV1 8 | 16.2% / 41% · ~16% | 0.41 / 1.29 · 0.28 / 1.15 dB |
+
+Planning from the predictions against the measured oracle: no gap on
+single-scene sets; on GTA V (several scenes) 0.25–1.1 VMAF-proxy points on
+this coarse 5-CRF grid, where preset 8's model, scored on the same coarse
+subset of its own data, shows 0.3–1.5. SVT-AV1's two-pass is even tighter
+at slow presets (per chunk: median 0.5–0.6%, p90 1.0–1.5%, bias −0.4 to
+−0.7%, `lab av1rc`), so the controller settings are preset 8's. x264
+slower/veryslow overshoot ~3% less than medium (browser runs), so their
+bias prior is 1.0 + 1.5/frames instead of 1.03 + 1.5/frames.
+
+At presets ≤ 6 SVT-AV1 runs its first pass at preset 9 (above 6, at its
+fastest preset), so the first pass costs 4–40% of the final one.
+
+**Levels** (lab BD-rate at equal PSNR against the codec's Balanced level;
+time per frame in wasm, both passes, V8, 960×540, fast-moving GTA V; calmer
+footage such as StarCraft 2 encodes ~2× faster):
+
+| codec | level | preset | bitrate at equal quality | time |
+|---|---|---|---|---|
+| H.264 | Fast | veryfast | +7% | 0.5× |
+| | Balanced | medium | — | 1× (0.17 s/frame) |
+| | Slow | slower | −6.6% | 3.2× |
+| | Slowest | veryslow | −12.7% | 5.1× |
+| AV1 | Balanced | 8 | — | 1× (0.63 s/frame) |
+| | Slow | 6 | −12% | 1.8× |
+| | Slower | 5 | −19% | 2.4× |
+| | Much slower | 4 | −24.5% | 3.1× |
+| | Very slow | 3 | −30% | 4.8× |
+| | Slowest | 2 (smallifier.py's) | −37% | 10.5× |
+
+**At an aggressive target.** GTA V's 60 s into 833 kB is the bitrate of
+24 minutes in 20 MB (480×270, ~84 kbps video), scored with VMAF against
+the source at the output size (`tools/compare_vmaf.py`):
+
+| | VMAF mean | p5 | min | PSNR |
+|---|---|---|---|---|
+| x264 two-pass, same bitrate | 51.2 | 38.5 | 32.5 | 28.09 dB |
+| AV1 Balanced (preset 8) | 70.0 | 44.3 | 31.1 | 30.32 dB |
+| AV1 Much slower (preset 4) | 74.3 | 58.1 | 39.2 | 31.54 dB |
+| AV1 Slowest (preset 2) | **76.6** | **61.3** | **44.9** | 32.21 dB |
+
+The slow presets help most where it hurts: the hardest scene (at the
+encoder's quantiser limit on preset 8) gains the most.
+
+**Measured quality for AV1.** SVT-AV1 reports a frame's luma SSE when asked
+per picture (`COMPUTE_QUALITY_EVENT` with PSNR only; `enable-stat-report`
+would also compute the slow SSIM). Summed over a chunk it matches decoded
+output within 0.02 dB on average (max 0.14), so AV1 results now show
+measured PSNR like x264.
+
+**Long runs.** Each finished chunk (packets, first-pass statistics, the
+requested size) is written to the origin-private file system; choosing the
+same file again finds the run's manifest, restores its settings, and the
+controller takes the stored chunks as finished (`sm_ctl_restore`), so only
+the rest is encoded. The run is deleted when it completes; starting a
+different run drops it. A screen wake lock is held while encoding. The time
+estimate before starting uses the speed table above, chunk parallelism
+(a short clip may have fewer chunks than workers) and source decoding; the
+progress ETA weighs first-pass frames by their relative cost.
+
+## 8. Things found along the way
 
 * wasm-ld links a cdylib for WASI as a *command* unless `__wasm_call_ctors`
   is referenced: every export then runs libc destructors on return, whose
@@ -202,8 +302,13 @@ output is slow.
 * ffmpeg's `gray` pixel format is full range: decoding limited-range video
   to `gray` for comparisons silently scales luma (−1.3 dB, or "29 dB
   between identical frames").
+* SVT-AV1 builds each encoder's block geometry through file-scope statics
+  (`utility.c`), so two encoders created at the same time in one process
+  corrupt each other's tables (division by zero in mode decision, heap
+  corruption), more often with different presets. Browser workers each have
+  their own wasm instance; natively, `Svt::open` serialises creation.
 
-## 8. Limitations
+## 9. Limitations
 
 * Sources with very long GOPs (some screen recorders write a single
   keyframe) make every analysis segment and chunk decode from the nearest
@@ -211,14 +316,19 @@ output is slow.
 * 10-bit and HDR inputs are reduced to 8-bit without tone mapping.
 * HEVC/AV1 input depends on the browser having a decoder for it.
 
-## 9. Possible next steps
+## 10. Possible next steps
 
 * Model-based output-size choice (native lower size ≈ 0.6× the bytes of the
   same-size prefilter rung at −0.5…−1.3 dB, consistently across clips).
 * WASM-SIMD versions of x264's hottest C kernels (SATD 8×4, get_ref,
   mc_chroma, SAD 16×16 take ~45% of encode time).
 * AAC audio option for old Apple devices.
-* A slower, higher-quality AV1 preset (6); a lower bits-per-pixel
-  threshold for AV1's output size (it uses H.264's 0.03 today).
+* A lower bits-per-pixel threshold for AV1's output size (it uses H.264's
+  0.03 today), and lower frame-rate choices for extreme targets.
+* Longer chunks at very low bitrates: at ~85 kbps an 8 s chunk's keyframe is
+  5–8% of its bytes.
+* Keep a chunk's scaled frames between its two passes when they fit in
+  memory: each pass decodes the source again, which for a high-resolution
+  source and a small output costs about as much as a fast preset's encode.
 * Count histogram bins fractionally at the quantiser threshold, so
   predicted size is smooth in CRF instead of slightly stepped.

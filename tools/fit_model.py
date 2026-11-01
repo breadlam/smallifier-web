@@ -10,7 +10,7 @@ The model works from the analysis histograms only (no encodes):
   bits_frame   = a * nz + b * lv + c * mbs            (separately for I and P)
   bytes(chunk) = [bits_I(crf + dI) + bits_P(crf + dP)] / 8
 
-Usage: fit_model.py [--holdout CLIP] files...
+Usage: fit_model.py [--save OUT.json] [--init FIT.json] [--holdout CLIP] files...
 Prints fitted constants (to paste into crates/core/src/model.rs) and the
 prediction error, overall and on any held-out clip.
 """
@@ -136,6 +136,12 @@ def main():
     if args and args[0] == "--save":
         save = args[1]
         args = args[2:]
+    x0 = None
+    if args and args[0] == "--init":
+        # Start from another fit (local optima differ between presets).
+        f = json.load(open(args[1]))
+        x0 = list(f["rate"]) + [f.get("qd", 7.0)]
+        args = args[2:]
     holdout = None
     if args and args[0] == "--holdout":
         holdout = args[1]
@@ -147,8 +153,8 @@ def main():
     av1 = any(json.load(open(a))["preset"].startswith("svt") for a in args)
     if av1:
         # Also fit the CRF scale.
-        fit = least_squares(residuals, X0 + [7.0], bounds=(LO + [3.0], HI + [16.0]), args=(train,), loss="soft_l1",
-                            f_scale=0.1)
+        fit = least_squares(residuals, x0 or X0 + [7.0], bounds=(LO + [3.0], HI + [16.0]), args=(train,),
+                            loss="soft_l1", f_scale=0.1)
         QD = fit.x[-1]
         p = fit.x[:len(NAMES)]
         print(f"qd (CRF per doubling) = {QD:.4f}")

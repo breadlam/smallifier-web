@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--dump", default=None, help="A:B — save decoded luma of output frames A..B (diagnostics) and exit")
     ap.add_argument("--raw", action="store_true", help="with --dump: luma straight from VideoFrame.copyTo, no wasm")
+    ap.add_argument("--interrupt", type=int, default=0,
+                    help="cancel once this many chunks are encoded, then start again (tests resuming)")
     args = ap.parse_args()
 
     srv = serve()
@@ -84,7 +86,24 @@ def main():
         page.select_option("#maxres", args.maxres)
         page.select_option("#audio", args.audio)
         page.select_option("#workers", args.workers)
+        print("estimate:", page.text_content("#estimate"))
         t0 = time.time()
+        if args.interrupt:
+            page.click("#go")
+            page.wait_for_function(f"(document.getElementById('log').textContent.match(/  chunk \\d+ \\(/g) || []).length >= {args.interrupt}",
+                                   timeout=args.timeout * 1000, polling=500)
+            page.click("#cancel")
+            page.wait_for_function("!document.getElementById('go').disabled", timeout=60000)
+            print(f"cancelled after {args.interrupt} chunks ({time.time() - t0:.1f}s); reloading")
+            # As after a closed tab: reload, choose the file again, and let the
+            # page restore the interrupted run's settings by itself.
+            page.select_option("#codec", "h264")
+            page.goto(url)
+            page.wait_for_function("window.__smallifierReady === true", timeout=60000)
+            page.set_input_files("#file", args.clip)
+            page.wait_for_selector("#resume-note:not([hidden])", timeout=60000)
+            print("resume note:", page.text_content("#resume-note"))
+            print("restored:", page.evaluate("['target','unit','codec','preset','fps','audio'].map(k => document.getElementById(k).value)"))
         page.click("#go")
         page.wait_for_function("window.__smallifierResult || !document.getElementById('error').hidden",
                                timeout=args.timeout * 1000, polling=1000)

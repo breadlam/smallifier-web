@@ -396,7 +396,7 @@ pub unsafe extern "C" fn sm_plan(json_ptr: *const u8, json_len: usize, stats_ptr
             gain: if (w, h) == (inp.out_w, inp.out_h) { Gain::identity() } else { Gain::for_rung(inp.out_w, inp.out_h, w, h) },
         })
         .collect();
-    let m = model::model_for(&inp.preset);
+    let Some(m) = model::model_for(&inp.preset) else { return err(format!("no model for preset {}", inp.preset)) };
     let p = plan::allocate(m, &chunks, &chunk_stats, &rungs, inp.budget);
     let frames: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
     with(|s| s.controller = Some(Controller::new(inp.budget, p.chunk_bytes.clone(), frames, m)));
@@ -416,6 +416,12 @@ pub extern "C" fn sm_ctl_target(i: usize) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn sm_ctl_finished(i: usize, bytes: f64) {
     with(|s| s.controller.as_mut().unwrap().finished(i, bytes));
+}
+
+/// Chunk `i` comes from an interrupted earlier run (see web/app.js resume).
+#[unsafe(no_mangle)]
+pub extern "C" fn sm_ctl_restore(i: usize, requested: f64, actual: f64) {
+    with(|s| s.controller.as_mut().unwrap().restore(i, requested, actual));
 }
 
 /// Re-runs that remove `excess` bytes from the output (negative: add).
@@ -447,7 +453,8 @@ struct EncIn {
     rung_h: usize,
     fps_num: u32,
     fps_den: u32,
-    /// x264 preset ("medium", ...) or "svtN" for SVT-AV1 preset N.
+    /// x264 preset ("medium", ...) or "svtN" / "svtN-10" for SVT-AV1 preset
+    /// N at 8 / 10 bits.
     preset: String,
     /// Rate control and pass options: x264 "bitrate=900:pass=1:stats=/s0";
     /// SVT-AV1 "tbr=900000b" (the pass comes from `first_pass`, and the
@@ -475,6 +482,8 @@ struct EncSession {
     prefilter: Option<Prefilter>,
     packets: Vec<OutPacket>,
     frames: i64,
+    #[cfg_attr(not(feature = "av1"), allow(dead_code))]
+    pixels: usize,
     keep: bool,
 }
 
@@ -489,7 +498,7 @@ pub unsafe extern "C" fn sm_set_stats(ptr: *const u8, len: usize) {
 }
 
 fn open_encoder(e: &EncIn) -> Result<Encoder, String> {
-    if let Some(_p) = model::svt_preset(&e.preset) {
+    if let Some((_p, _depth)) = model::svt_preset(&e.preset) {
         #[cfg(feature = "av1")]
         {
             let stats = if e.first_pass { Vec::new() } else { with(|s| std::mem::take(&mut s.stats)) };
@@ -498,7 +507,9 @@ fn open_encoder(e: &EncIn) -> Result<Encoder, String> {
                 height: e.out_h as u32,
                 fps_num: e.fps_num,
                 fps_den: e.fps_den,
-                opts: model::svt_opts(_p, &format!("rc=1:{}:gop-constraint-rc=1", e.rc)),
+                // The second pass reports its luma error (PSNR only; SSIM is slow).
+                opts: model::svt_opts(_p, _depth, &format!("rc=1:{}:gop-constraint-rc=1:measure={}", e.rc,
+                                                            !e.first_pass as u8)),
                 pass: if e.first_pass { 1 } else { 2 },
                 stats,
             };
@@ -538,7 +549,8 @@ pub unsafe extern "C" fn sm_enc_begin(ptr: *const u8, len: usize) -> i32 {
     };
     let scaler = ((e.src_w, e.src_h) != (e.out_w, e.out_h)).then(|| FrameScaler::new(e.src_w, e.src_h, e.out_w, e.out_h));
     let prefilter = Prefilter::new(e.out_w, e.out_h, e.rung_w, e.rung_h);
-    with(|s| s.enc = Some(EncSession { enc, scaler, prefilter, packets: Vec::new(), frames: 0, keep: !e.first_pass }));
+    with(|s| s.enc = Some(EncSession { enc, scaler, prefilter, packets: Vec::new(), frames: 0,
+                                     pixels: e.out_w * e.out_h, keep: !e.first_pass }));
     0
 }
 
@@ -576,14 +588,16 @@ pub extern "C" fn sm_enc_push() -> i32 {
 /// Result: [json len u32][json][packet data...][first-pass stats...]; json
 /// has the codec, its decoder configuration (H.264 sps/pps, or the AV1
 /// sequence header) as hex, per-packet [size, pts, key], the mean luma MSE
-/// the encoder measured against its (prefiltered) input (x264 only; -1 for
-/// AV1) and the length of the trailing first-pass statistics (AV1 only).
+/// the encoder measured against its (prefiltered) input (-1 for a first
+/// pass) and the length of the trailing first-pass statistics (AV1 only).
 #[unsafe(no_mangle)]
 pub extern "C" fn sm_enc_end() -> i32 {
     let Some(mut e) = with(|s| s.enc.take()) else { return err("no encode session") };
     let hex = |v: &[u8]| v.iter().map(|b| format!("{b:02x}")).collect::<String>();
     #[cfg_attr(not(feature = "av1"), allow(unused_mut))]
     let mut stats = Vec::new();
+    #[cfg_attr(not(feature = "av1"), allow(unused_mut))]
+    let mut svt_mse = -1.0;
     let config = match &mut e.enc {
         Encoder::X264(x) => {
             loop {
@@ -609,7 +623,9 @@ pub extern "C" fn sm_enc_end() -> i32 {
                 }
                 Err(m) => return err(m),
             }
-            if !e.keep {
+            if e.keep {
+                svt_mse = a.sse() / (e.frames.max(1) as f64 * e.pixels as f64);
+            } else {
                 stats = a.stats();
             }
             json!({ "codec": "av1", "av1_header": hex(&a.header()) })
@@ -619,7 +635,7 @@ pub extern "C" fn sm_enc_end() -> i32 {
     let mse: f64 = if measured {
         e.packets.iter().map(|p| 65025.0 / 10f64.powf(p.psnr_y / 10.0)).sum::<f64>() / e.packets.len() as f64
     } else {
-        -1.0
+        svt_mse
     };
     let table: Vec<[i64; 3]> = e.packets.iter().map(|p| [p.data.len() as i64, p.pts, p.key as i64]).collect();
     let bytes: usize = e.packets.iter().map(|p| p.data.len()).sum();

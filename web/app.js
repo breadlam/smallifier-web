@@ -101,6 +101,10 @@ function fmtBytes(b) {
 
 function fmtTime(s) {
   if (!isFinite(s)) return "–";
+  if (s >= 3600) {
+    const m = Math.round(s / 60);
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+  }
   const m = Math.floor(s / 60);
   return m ? `${m}m ${Math.round(s % 60)}s` : `${s.toFixed(1)}s`;
 }
@@ -321,14 +325,29 @@ async function runOnPool(pool, tasks) {
 }
 
 // --------------------------------------------------------------- presets
+//
+// Each preset has its own fitted size/quality model (crates/core/src/model.rs).
+// speed: wasm encode speed per worker in frames/s at 960×540 for the first
+// and the final pass (tools/node_speed.mjs in Node/V8 on a 120-frame GTA V
+// segment), scaled by pixel count for the time estimate. mem: MB per
+// worker, base + per output megapixel. gain: bitrate change at equal PSNR
+// against the codec's Balanced preset (lab BD-rate, tools/preset_gain.py).
 
 const PRESETS = {
   h264: [
-    ["medium", "Balanced (x264 medium)", ""],
-    ["veryfast", "Fast (x264 veryfast)", "About 3× quicker and a little softer."],
+    { id: "veryfast", label: "Fast", detail: "x264 veryfast", speed: [21.6, 24.4], mem: [20, 105], gain: +7 },
+    { id: "medium", label: "Balanced", detail: "x264 medium", speed: [21.7, 7.83], mem: [20, 160], gain: 0, default: true },
+    { id: "slower", label: "Slow", detail: "x264 slower", speed: [13.1, 2.09], mem: [20, 160], gain: -7 },
+    { id: "veryslow", label: "Slowest", detail: "x264 veryslow", speed: [7.22, 1.34], mem: [20, 240], gain: -13 },
   ],
-  av1: [["svt8", "Balanced (SVT-AV1 preset 8)",
-          "About 4× slower than H.264 Balanced at 720p, and much slower at 1080p."]],
+  av1: [
+    { id: "svt8", label: "Balanced", detail: "SVT-AV1 preset 8", speed: [11.0, 1.86], mem: [40, 160], gain: 0, default: true },
+    { id: "svt6", label: "Slow", detail: "SVT-AV1 preset 6", speed: [3.40, 1.16], mem: [40, 160], gain: -12 },
+    { id: "svt5", label: "Slower", detail: "SVT-AV1 preset 5", speed: [3.43, 0.83], mem: [40, 172], gain: -19 },
+    { id: "svt4", label: "Much slower", detail: "SVT-AV1 preset 4", speed: [3.54, 0.60], mem: [40, 185], gain: -24 },
+    { id: "svt3", label: "Very slow", detail: "SVT-AV1 preset 3", speed: [3.26, 0.37], mem: [40, 191], gain: -30 },
+    { id: "svt2", label: "Slowest", detail: "SVT-AV1 preset 2, as smallifier.py", speed: [3.16, 0.16], mem: [40, 195], gain: -37 },
+  ],
 };
 const CODEC_NOTES = {
   h264: "",
@@ -336,17 +355,130 @@ const CODEC_NOTES = {
     "Apple devices need an AV1 hardware decoder (iPhone 15 Pro / M3 Mac or later).",
 };
 
+const presetInfo = (id) => Object.values(PRESETS).flat().find((p) => p.id === id);
+
 function fillPresets() {
   const codec = $("codec").value;
   const sel = $("preset");
-  sel.innerHTML = PRESETS[codec].map(([v, label]) => `<option value="${v}">${label}</option>`).join("");
-  const note = () => ($("preset-note").textContent = PRESETS[codec].find(([v]) => v === sel.value)?.[2] ?? "");
-  sel.onchange = note;
-  note();
+  const list = PRESETS[codec];
+  const base = list.find((p) => p.default);
+  const cost = (p) => 1 / p.speed[0] + 1 / p.speed[1];
+  sel.innerHTML = list.map((p) => `<option value="${p.id}"${p.default ? " selected" : ""}>${p.label} (${p.detail})</option>`)
+    .join("");
+  sel.onchange = () => {
+    const p = presetInfo(sel.value);
+    const rel = cost(p) / cost(base);
+    $("preset-note").textContent = p === base ? "" :
+      `About ${rel < 1 ? (1 / rel).toFixed(1) + "× quicker" : rel.toFixed(1) + "× the time of Balanced"}; ` +
+      (p.gain < 0 ? `sharper at the same size (matches Balanced's quality with ~${-p.gain}% fewer bytes).`
+                  : `a little softer at the same size (needs ~${p.gain}% more bytes for Balanced's quality).`);
+    updateEstimate();
+  };
+  sel.onchange();
   $("codec-note").textContent = CODEC_NOTES[codec];
 }
 
 const isAv1 = (preset) => preset.startsWith("svt");
+
+// ---------------------------------------------------------------- resume
+//
+// Finished chunks are kept in the origin-private file system until the run
+// completes, so a closed or crashed tab (or a restarted computer) can
+// continue a long encode: choosing the same file with the same settings
+// reuses every chunk that was already encoded. Best effort: without OPFS,
+// or if writing fails, runs simply aren't resumable.
+
+const RESUME_VERSION = 1;
+const RESUME_ROOT = "smallifier-resume";
+const FORM_IDS = ["target", "unit", "maxres", "fps", "audio", "codec", "preset"];
+
+class ResumeStore {
+  static async open(st, file) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const top = await root.getDirectoryHandle(RESUME_ROOT, { create: true });
+      const id = JSON.stringify([RESUME_VERSION, file.name, file.size, file.lastModified, st.preset, st.target,
+                                 st.out.w, st.out.h, st.fpsN, st.fpsD, st.wantAudio ? st.audioBps : 0]);
+      const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", te.encode(id)));
+      const name = [...hash.subarray(0, 12)].map((b) => b.toString(16).padStart(2, "0")).join("");
+      // One resumable run at a time: drop other runs' leftovers.
+      for await (const [n] of top.entries()) if (n !== name) await top.removeEntry(n, { recursive: true }).catch(() => {});
+      const dir = await top.getDirectoryHandle(name, { create: true });
+      // What to show (and restore) when this file is chosen again.
+      const form = Object.fromEntries(FORM_IDS.map((k) => [k, $(k).value]));
+      const manifest = { file: [file.name, file.size, file.lastModified], form };
+      const w = await (await dir.getFileHandle("manifest.json", { create: true })).createWritable();
+      await w.write(JSON.stringify(manifest));
+      await w.close();
+      return new ResumeStore(top, name, dir);
+    } catch (e) {
+      log(`resume: not available (${e.message})`);
+      return null;
+    }
+  }
+
+  /** An interrupted run of `file`: { form, chunks } (chunks stored so far), or null. */
+  static async find(file) {
+    try {
+      const top = await (await navigator.storage.getDirectory()).getDirectoryHandle(RESUME_ROOT);
+      for await (const [, dir] of top.entries()) {
+        const m = JSON.parse(await (await (await dir.getFileHandle("manifest.json")).getFile()).text());
+        if (JSON.stringify(m.file) !== JSON.stringify([file.name, file.size, file.lastModified])) continue;
+        let chunks = 0;
+        for await (const [n] of dir.entries()) if (n !== "manifest.json") chunks++;
+        return { form: m.form, chunks };
+      }
+    } catch {
+      // nothing stored, or no OPFS
+    }
+    return null;
+  }
+
+  constructor(top, name, dir) {
+    Object.assign(this, { top, name, dir, broken: false });
+  }
+
+  static key(c, rung) {
+    return `${c.start}-${c.end}-${rung[0]}x${rung[1]}`;
+  }
+
+  /** The stored chunk, or null: { head, data, stats, requested }. */
+  async load(c, rung) {
+    try {
+      const buf = new Uint8Array(await (await (await this.dir.getFileHandle(ResumeStore.key(c, rung))).getFile()).arrayBuffer());
+      const ml = new DataView(buf.buffer).getUint32(0, true);
+      const meta = JSON.parse(td.decode(buf.subarray(4, 4 + ml)));
+      let o = 4 + ml;
+      const take = (n) => buf.slice(o, (o += n));
+      const data = take(meta.head.bytes);
+      const stats = {};
+      for (const [k, n] of meta.stats) stats[k] = take(n);
+      return o === buf.length ? { head: meta.head, data, stats, requested: meta.requested } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async save(c, rung, r, requested) {
+    if (this.broken) return;
+    try {
+      const statKeys = Object.entries(r.stats).map(([k, v]) => [k, v.length]);
+      const meta = te.encode(JSON.stringify({ head: r.head, requested, stats: statKeys }));
+      const len = new Uint8Array(4);
+      new DataView(len.buffer).setUint32(0, meta.length, true);
+      const w = await (await this.dir.getFileHandle(ResumeStore.key(c, rung), { create: true })).createWritable();
+      await w.write(new Blob([len, meta, r.data, ...Object.values(r.stats)]));
+      await w.close();
+    } catch (e) {
+      this.broken = true;
+      log(`resume: can't store chunks (${e.message}); this run won't be resumable`);
+    }
+  }
+
+  async clear() {
+    await this.top.removeEntry(this.name, { recursive: true }).catch(() => {});
+  }
+}
 
 // ------------------------------------------------------------------ main
 
@@ -363,17 +495,100 @@ function fillWorkerOptions() {
   for (let i = 1; i <= Math.max(16, cores); i++) sel.innerHTML += `<option value="${i}">${i}</option>`;
 }
 
-function workerCount(out) {
+/** Auto worker count: one per spare core, within a memory budget. */
+function workerCount(out, preset) {
   const v = $("workers").value;
   if (v !== "auto") return +v;
   const cores = navigator.hardwareConcurrency || 4;
-  // x264 needs ~350 MB per encoder at 1080p, ~170 MB at 720p.
-  const px = out.w * out.h;
-  const memCap = px > 1.5e6 ? 4 : px > 0.6e6 ? 6 : 8;
-  const devMem = navigator.deviceMemory; // Chrome only; GB, capped at 8
-  const memCap2 = devMem ? Math.max(1, Math.floor((devMem * 1024 * 0.5) / (px > 1.5e6 ? 350 : 170))) : memCap;
-  return Math.max(1, Math.min(cores - 1, memCap, memCap2));
+  const [base, perMpx] = presetInfo(preset).mem;
+  const perWorker = base + (perMpx * out.w * out.h) / 1e6;
+  // Half the device's memory where the browser says (Chrome: GB, capped at
+  // 8); otherwise assume ~1.5 GB is available.
+  const budget = navigator.deviceMemory ? navigator.deviceMemory * 1024 * 0.5 : 1536;
+  return Math.max(1, Math.min(cores - 1, 16, Math.floor(budget / perWorker)));
 }
+
+/** The encode settings implied by the form (shared by the estimate and the run). */
+function currentSettings() {
+  const video = tracks.find((t) => t.kind === "video");
+  const audioTrack = tracks.find((t) => t.kind === "audio");
+  const vt = analyseVideoTrack(video);
+  const target = +$("target").value * +$("unit").value;
+  const [fpsN, fpsD] = outputFps(vt.srcFps, +$("fps").value);
+  const fps = fpsN / fpsD;
+  const frames = Math.max(1, Math.round(vt.duration * fps));
+  const duration = frames / fps;
+  const preset = $("preset").value;
+  const audioBps = $("audio").value === "auto"
+    ? Math.round(Math.max(AUDIO_MIN, Math.min(AUDIO_MAX, ((target * 8) / duration) * AUDIO_FRACTION)))
+    : +$("audio").value;
+  const wantAudio = audioBps > 0 && !!audioTrack;
+  const roughVideo = target * (1 - SAFETY) - (wantAudio ? (audioBps * duration) / 8 : 0);
+  const maxShort = $("maxres").value === "auto" ? 1080 : +$("maxres").value;
+  const out = chooseOutput(video.width, video.height, maxShort, (roughVideo * 8) / duration, fps);
+  const nWorkers = workerCount(out, preset);
+  return { video, audioTrack, vt, target, fpsN, fpsD, fps, frames, duration, preset, audioBps, wantAudio, roughVideo,
+           out, nWorkers };
+}
+
+// Throughputs for the estimate (desktop-class machine): the analysis pass
+// over the whole page, and source decoding per worker (each encoder pass
+// decodes its chunk's source frames again).
+const ANALYSIS_PX_PER_SEC = 400e6;
+const DECODE_PX_PER_SEC = 150e6;
+
+/** Rough wall time of a run with these settings, in seconds. */
+function estimateSeconds(st) {
+  const p = presetInfo(st.preset);
+  const srcPerOut = st.vt.n / st.frames; // source frames decoded per output frame
+  const decode = (2 * srcPerOut * st.video.width * st.video.height) / DECODE_PX_PER_SEC;
+  const perFrame = ((st.out.w * st.out.h) / (960 * 540)) * (1 / p.speed[0] + 1 / p.speed[1]) + decode;
+  // Chunks are the unit of parallel work: a short clip may have fewer
+  // chunks than workers (scene cuts make ~1.4x the 8 s minimum), and the
+  // longest chunk bounds the wall time.
+  const chunkFrames = Math.min(st.frames, Math.round(MAX_CHUNK_SEC * st.fps));
+  const workers = Math.min(st.nWorkers, Math.ceil((1.4 * st.frames) / chunkFrames));
+  const encode = Math.max((st.frames * perFrame) / workers, 0.8 * chunkFrames * perFrame);
+  const analysis = (st.vt.n * st.video.width * st.video.height) / ANALYSIS_PX_PER_SEC;
+  return encode + analysis;
+}
+
+function updateEstimate() {
+  const el = $("estimate");
+  if (!tracks || !el) return;
+  try {
+    const st = currentSettings();
+    if (!(st.roughVideo > 0)) {
+      el.textContent = "";
+      return;
+    }
+    el.textContent = `Output ${st.out.w}×${st.out.h} at ${st.fps.toFixed(st.fps % 1 ? 2 : 0)} fps with ${st.nWorkers} ` +
+      `worker${st.nWorkers === 1 ? "" : "s"}; roughly ${fmtTime(estimateSeconds(st))} on a typical desktop ` +
+      "for fast-moving footage (calmer footage is quicker; much depends on the device).";
+  } catch {
+    el.textContent = "";
+  }
+}
+
+// Keeps the screen (and with it, on most systems, the machine) awake during
+// long encodes; the browser drops the lock when the tab is hidden.
+let wakeLock = null;
+let wantWake = false;
+async function requestWakeLock() {
+  if (!wantWake || wakeLock || !navigator.wakeLock || document.visibilityState !== "visible") return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.onrelease = () => (wakeLock = null);
+  } catch {
+    wakeLock = null;
+  }
+}
+function holdWake(on) {
+  wantWake = on;
+  if (on) requestWakeLock();
+  else wakeLock?.release().catch(() => {});
+}
+document.addEventListener("visibilitychange", requestWakeLock);
 
 async function onFile(f) {
   $("error").hidden = true;
@@ -405,6 +620,23 @@ async function onFile(f) {
   $("settings").hidden = false;
   log(`video ${video.codec} ${video.width}x${video.height} ${vt.n} samples, ${vt.keys.length} keyframes, ` +
       `${vt.srcFps.toFixed(3)} fps, ${vt.duration.toFixed(2)} s; audio ${audio ? audio.codec : "none"}`);
+  $("resume-note").hidden = true;
+  const prior = await ResumeStore.find(f);
+  if (prior?.chunks) {
+    // Same settings as the interrupted run, so its chunks are reused.
+    for (const k of FORM_IDS) {
+      $(k).value = prior.form[k];
+      if (k === "codec") fillPresets();
+    }
+    if (!$("preset").value) fillPresets(); // a preset this version no longer offers
+    $("preset").onchange();
+    $("resume-note").textContent = `An interrupted run of this file was found (${prior.chunks} chunk` +
+      `${prior.chunks === 1 ? "" : "s"} already encoded). Its settings are restored; press Smallify to continue it, ` +
+      "or change them to start over.";
+    $("resume-note").hidden = false;
+    log(`resume: found an interrupted run with ${prior.chunks} chunk(s)`);
+  }
+  updateEstimate();
 }
 
 async function smallify() {
@@ -419,10 +651,11 @@ async function smallify() {
   const mark = (k, t) => (timing[k] = (performance.now() - t) / 1000);
   let pool = null;
   try {
-    const video = tracks.find((t) => t.kind === "video");
-    const audioTrack = tracks.find((t) => t.kind === "audio");
-    const vt = analyseVideoTrack(video);
+    const st = currentSettings();
+    const { video, audioTrack, vt, target, fpsN, fpsD, fps, frames, duration, preset, audioBps, wantAudio, roughVideo,
+            out, nWorkers } = st;
     setPhase("Reading");
+    holdWake(true);
 
     // Decoder support (fail early with a clear message).
     const vcfg = { codec: video.codec, codedWidth: video.width, codedHeight: video.height };
@@ -430,23 +663,7 @@ async function smallify() {
     if (!video.codec || !(await VideoDecoder.isConfigSupported(vcfg)).supported) {
       throw new Error(`This browser can't decode the ${video.codec_name} video in this file.`);
     }
-
-    // ---- targets
-    const target = +$("target").value * +$("unit").value;
-    const [fpsN, fpsD] = outputFps(vt.srcFps, +$("fps").value);
-    const fps = fpsN / fpsD;
-    const frames = Math.max(1, Math.round(vt.duration * fps));
-    const duration = frames / fps;
-    const preset = $("preset").value;
-    let audioBps = $("audio").value === "auto"
-      ? Math.round(Math.max(AUDIO_MIN, Math.min(AUDIO_MAX, ((target * 8) / duration) * AUDIO_FRACTION)))
-      : +$("audio").value;
-    const wantAudio = audioBps > 0 && audioTrack;
-    const roughVideo = target * (1 - SAFETY) - (wantAudio ? (audioBps * duration) / 8 : 0);
-    const maxShort = $("maxres").value === "auto" ? 1080 : +$("maxres").value;
-    const out = chooseOutput(video.width, video.height, maxShort, (roughVideo * 8) / duration, fps);
     const rungs = rungsFor(out);
-    const nWorkers = workerCount(out);
     log(`target ${fmtBytes(target)}; output ${out.w}x${out.h} @ ${fps.toFixed(3)} fps (${frames} frames), ` +
         `audio ${wantAudio ? audioBps / 1000 + " kbps" : "none"}, preset ${preset}, ${nWorkers} workers`);
     if (roughVideo <= 0) throw new Error("The target is too small to hold even the audio. Lower the audio bitrate or raise the target.");
@@ -570,16 +787,36 @@ async function smallify() {
     plan.scenes.forEach((s, i) => log(`  scene ${i}: ${s.frames} frames, rung ${rungs[s.rung].join("x")}, CRF~${s.crf}, ` +
                                       `${fmtBytes(s.bytes)}, ${s.psnr.toFixed(1)} dB`));
 
-    // ---- encode
-    setPhase("Encoding", `${chunks.length} chunk${chunks.length === 1 ? "" : "s"}`);
+    // ---- encode (resuming an interrupted run where possible)
     const tE = performance.now();
     const results = new Array(chunks.length);
-    let passFrames = 0;
+    const rungOf = (c) => rungs[plan.scenes[chunks[c].scene].rung];
+    const store = await ResumeStore.open(st, file);
+    let restoredFrames = 0;
+    if (store) {
+      for (let c = 0; c < chunks.length; c++) {
+        const r = await store.load(chunks[c], rungOf(c));
+        if (!r) continue;
+        results[c] = r;
+        wasm.ex.sm_ctl_restore(c, r.requested, r.head.bytes);
+        restoredFrames += chunks[c].end - chunks[c].start;
+      }
+      const n = results.filter(Boolean).length;
+      if (n) log(`resuming: ${n} of ${chunks.length} chunks (${restoredFrames} frames) already encoded by an earlier run`);
+    }
+    setPhase("Encoding", `${chunks.length} chunk${chunks.length === 1 ? "" : "s"}` +
+             (restoredFrames ? `, ${results.filter(Boolean).length} from the interrupted run` : ""));
     let encodes = 0;
-    const totalPassFrames = frames * 2;
+    // Progress in final-pass-equivalent frames: a first-pass frame costs
+    // speed[1] / speed[0] of a final-pass one.
+    const [s1, s2] = presetInfo(preset).speed;
+    const w1 = s2 / s1;
+    let passWork = 0;
+    let passFrames = restoredFrames;
+    const totalWork = (frames - restoredFrames) * (1 + w1);
     const chunkJob = (c) => ({
       ...base, chunk: c, start: chunks[c].start, end: chunks[c].end, out, preset,
-      rung: { w: rungs[plan.scenes[chunks[c].scene].rung][0], h: rungs[plan.scenes[chunks[c].scene].rung][1] },
+      rung: { w: rungOf(c)[0], h: rungOf(c)[1] },
       planned: plan.chunk_bytes[c], samples: sampleRange(video, vt, fpsN, fpsD, chunks[c].start, chunks[c].end),
     });
     const requested = new Array(chunks.length).fill(0);
@@ -589,11 +826,13 @@ async function smallify() {
         requested[c] = bytes;
         w.post({ type: "target", bytes });
       } else if (m.frames) {
-        passFrames += m.frames;
+        passWork += m.frames * (m.pass === 1 ? w1 : 1);
+        if (m.pass !== 1) passFrames += m.frames;
         const el = (performance.now() - tE) / 1000;
-        const eta = (el / passFrames) * (totalPassFrames - passFrames);
-        setProgress(passFrames / totalPassFrames, `Encoded ${Math.round(passFrames / 2)} of ${frames} frames ` +
-                    `(two passes) — about ${fmtTime(eta)} left`);
+        const eta = (el / passWork) * Math.max(0, totalWork - passWork);
+        setProgress(1 - (1 - passWork / totalWork) * (1 - restoredFrames / frames),
+                    `Final pass done for ${Math.min(passFrames, frames)} of ${frames} frames — ` +
+                    `about ${fmtTime(eta)} left`);
       }
     };
     await Promise.all(pool.map(async (w) => {
@@ -605,6 +844,7 @@ async function smallify() {
         encodes += 2;
         results[c] = r;
         wasm.ex.sm_ctl_finished(c, r.head.bytes);
+        await store?.save(chunks[c], rungOf(c), r, requested[c]);
         log(`  chunk ${c} (${chunks[c].end - chunks[c].start} frames): planned ${fmtBytes(plan.chunk_bytes[c])}, ` +
             `asked ${fmtBytes(requested[c])}, got ${fmtBytes(r.head.bytes)} (${((r.head.bytes / requested[c] - 1) * 100).toFixed(1)}%)`);
       }
@@ -670,11 +910,13 @@ async function smallify() {
             `got ${fmtBytes(r.head.bytes)}`);
         results[f.chunk] = r;
         wasm.ex.sm_ctl_finished(f.chunk, r.head.bytes);
+        await store?.save(chunks[f.chunk], rungOf(f.chunk), r, f.bytes);
       }));
       setPhase("Finishing");
       mp4 = mux();
     }
     mark("encode", tE);
+    await store?.clear();
     const elapsed = (performance.now() - started) / 1000;
 
     // ---- report
@@ -700,6 +942,7 @@ async function smallify() {
     showError(e.message);
     console.error(e);
   } finally {
+    holdWake(false);
     pool?.forEach((w) => w.terminate());
     activePool = null;
     $("go").disabled = false;
@@ -783,6 +1026,7 @@ async function boot() {
   };
   $("go").onclick = smallify;
   $("codec").onchange = fillPresets;
+  for (const id of ["target", "unit", "maxres", "fps", "audio", "workers"]) $(id).addEventListener("input", updateEstimate);
   fillPresets();
   $("cancel").onclick = () => {
     cancelled = true;

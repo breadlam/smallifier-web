@@ -286,12 +286,12 @@ fn moov(v: &VideoTrack, a: Option<&AudioTrack>, runs: &[Run], data_start: u64, l
                                     }),
                                     VideoCodec::Av1 { seq_header } => w.bx(b"av1C", |w| {
                                         // AV1-ISOBMFF: marker/version, profile/level,
-                                        // tier + 8-bit 4:2:0 colour flags, no
+                                        // tier + bit depth and chroma flags, no
                                         // presentation delay, then the sequence header.
-                                        let (profile, level, tier) = av1_seq_info(seq_header);
+                                        let info = av1_seq_info(seq_header);
                                         w.u8(0x81);
-                                        w.u8(profile << 5 | level);
-                                        w.u8(tier << 7 | 0b0000_1100);
+                                        w.u8(info.profile << 5 | info.level);
+                                        w.u8(info.flags());
                                         w.u8(0);
                                         w.bytes(seq_header);
                                     }),
@@ -459,10 +459,36 @@ impl Bits<'_> {
     }
 }
 
-/// (seq_profile, seq_level_idx[0], seq_tier[0]) from a sequence header OBU.
-pub fn av1_seq_info(obu: &[u8]) -> (u8, u8, u8) {
+/// The sequence header fields the av1C box repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Av1SeqInfo {
+    pub profile: u8,
+    pub level: u8,
+    pub tier: u8,
+    pub high_bitdepth: u8,
+    pub twelve_bit: u8,
+    pub monochrome: u8,
+    pub ss_x: u8,
+    pub ss_y: u8,
+    pub chroma_sample_position: u8,
+}
+
+impl Av1SeqInfo {
+    /// av1C's third byte: tier, bit depth and chroma format flags.
+    fn flags(&self) -> u8 {
+        self.tier << 7 | self.high_bitdepth << 6 | self.twelve_bit << 5 | self.monochrome << 4 | self.ss_x << 3
+            | self.ss_y << 2 | self.chroma_sample_position
+    }
+}
+
+/// Parses a sequence header OBU as far as its colour config (AV1 spec 5.5).
+pub fn av1_seq_info(obu: &[u8]) -> Av1SeqInfo {
+    let mut info = Av1SeqInfo {
+        profile: 0, level: 31, tier: 0, high_bitdepth: 0, twelve_bit: 0, monochrome: 0, ss_x: 1, ss_y: 1,
+        chroma_sample_position: 0,
+    };
     if obu.is_empty() {
-        return (0, 31, 0);
+        return info;
     }
     let ext = (obu[0] >> 2) & 1;
     let has_size = (obu[0] >> 1) & 1;
@@ -475,31 +501,106 @@ pub fn av1_seq_info(obu: &[u8]) -> (u8, u8, u8) {
     }
     let mut b = Bits { d: &obu[p.min(obu.len())..], pos: 0 };
     let profile = b.f(3) as u8;
-    let _still = b.f(1);
-    if b.f(1) == 1 {
-        // reduced_still_picture_header
-        return (profile, b.f(5) as u8, 0);
-    }
-    if b.f(1) == 1 {
-        // timing_info, then decoder_model_info if present
-        b.f(32);
-        b.f(32);
+    info.profile = profile;
+    b.f(1); // still_picture
+    let reduced = b.f(1) == 1;
+    if reduced {
+        info.level = b.f(5) as u8;
+    } else {
+        let mut decoder_model = false;
+        let mut delay_len = 0;
         if b.f(1) == 1 {
-            b.uvlc();
-        }
-        if b.f(1) == 1 {
-            b.f(5);
+            // timing_info
             b.f(32);
-            b.f(5);
-            b.f(5);
+            b.f(32);
+            if b.f(1) == 1 {
+                b.uvlc();
+            }
+            decoder_model = b.f(1) == 1;
+            if decoder_model {
+                delay_len = b.f(5) as usize + 1;
+                b.f(32);
+                b.f(5);
+                b.f(5);
+            }
+        }
+        let initial_display_delay = b.f(1) == 1;
+        let ops = b.f(5) + 1;
+        for i in 0..ops {
+            b.f(12); // operating_point_idc
+            let level = b.f(5) as u8;
+            let tier = if level > 7 { b.f(1) as u8 } else { 0 };
+            if i == 0 {
+                info.level = level;
+                info.tier = tier;
+            }
+            if decoder_model && b.f(1) == 1 {
+                b.f(delay_len);
+                b.f(delay_len);
+                b.f(1);
+            }
+            if initial_display_delay && b.f(1) == 1 {
+                b.f(4);
+            }
         }
     }
-    b.f(1); // initial_display_delay_present_flag
-    b.f(5); // operating_points_cnt_minus_1
-    b.f(12); // operating_point_idc[0]
-    let level = b.f(5) as u8;
-    let tier = if level > 7 { b.f(1) as u8 } else { 0 };
-    (profile, level, tier)
+    let wbits = b.f(4) as usize + 1;
+    let hbits = b.f(4) as usize + 1;
+    b.f(wbits);
+    b.f(hbits);
+    if !reduced && b.f(1) == 1 {
+        // frame_id_numbers_present_flag
+        b.f(4);
+        b.f(3);
+    }
+    b.f(3); // 128x128 superblocks, filter intra, intra edge filter
+    if !reduced {
+        b.f(4); // interintra, masked compound, warped motion, dual filter
+        let order_hint = b.f(1) == 1;
+        if order_hint {
+            b.f(2); // jnt_comp, ref_frame_mvs
+        }
+        let force_sct = if b.f(1) == 1 { 2 } else { b.f(1) };
+        if force_sct > 0 && b.f(1) == 0 {
+            b.f(1); // seq_force_integer_mv
+        }
+        if order_hint {
+            b.f(3);
+        }
+    }
+    b.f(3); // superres, cdef, restoration
+    // color_config
+    info.high_bitdepth = b.f(1) as u8;
+    if profile == 2 && info.high_bitdepth == 1 {
+        info.twelve_bit = b.f(1) as u8;
+    }
+    info.monochrome = if profile == 1 { 0 } else { b.f(1) as u8 };
+    let (mut cp, mut tc, mut mc) = (2, 2, 2);
+    if b.f(1) == 1 {
+        cp = b.f(8);
+        tc = b.f(8);
+        mc = b.f(8);
+    }
+    if info.monochrome == 1 {
+        (info.ss_x, info.ss_y) = (1, 1);
+    } else if cp == 1 && tc == 13 && mc == 0 {
+        (info.ss_x, info.ss_y) = (0, 0);
+    } else {
+        b.f(1); // color_range
+        (info.ss_x, info.ss_y) = match profile {
+            0 => (1, 1),
+            1 => (0, 0),
+            _ if info.twelve_bit == 1 => {
+                let x = b.f(1) as u8;
+                (x, if x == 1 { b.f(1) as u8 } else { 0 })
+            }
+            _ => (1, 0),
+        };
+        if info.ss_x == 1 && info.ss_y == 1 {
+            info.chroma_sample_position = b.f(2) as u8;
+        }
+    }
+    info
 }
 
 fn hdlr(w: &mut W, typ: &[u8; 4], name: &str) {
@@ -576,6 +677,13 @@ mod tests {
     fn av1_sequence_header_fields() {
         // As SVT-AV1 4.2 writes it for 1280x720 at 30 fps.
         let obu = [0x0a, 0x0c, 0x02, 0x00, 0x00, 0x2d, 0x2a, 0x67, 0xfd, 0x9e, 0x01, 0x7c, 0x00, 0x20];
-        assert_eq!(av1_seq_info(&obu), (0, 5, 0));
+        let info = av1_seq_info(&obu);
+        assert_eq!((info.profile, info.level, info.tier, info.high_bitdepth), (0, 5, 0, 0));
+        assert_eq!(info.flags(), 0b0000_1100);
+        // The same at 10 bits.
+        let obu10 = [0x0a, 0x0c, 0x02, 0x00, 0x00, 0x2d, 0x2a, 0x67, 0xfd, 0x9e, 0x01, 0x7c, 0x20, 0x20];
+        let info = av1_seq_info(&obu10);
+        assert_eq!((info.profile, info.high_bitdepth, info.ss_x, info.ss_y), (0, 1, 1, 1));
+        assert_eq!(info.flags(), 0b0100_1100);
     }
 }

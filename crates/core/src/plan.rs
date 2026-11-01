@@ -280,6 +280,13 @@ impl Controller {
         self.bias_n += 1.0;
     }
 
+    /// Chunk `i` was already encoded (an earlier, interrupted run): record
+    /// it as finished, as if its second pass had been asked for `requested`.
+    pub fn restore(&mut self, i: usize, requested: f64, actual: f64) {
+        self.state[i] = State::SecondPass { requested };
+        self.finished(i, actual);
+    }
+
     pub fn total(&self) -> f64 {
         self.state.iter().map(|s| if let State::Done { actual, .. } = s { *actual } else { 0.0 }).sum()
     }

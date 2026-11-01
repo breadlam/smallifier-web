@@ -175,7 +175,7 @@ impl Drop for Opus {
 
 #[cfg(feature = "av1")]
 pub mod av1 {
-    //! SVT-AV1 (needs real threads: native, or wasm32-wasip1-threads).
+    //! SVT-AV1: native, or single-threaded wasm (lp=1).
 
     use std::ffi::{CString, c_char, c_int, c_void};
 
@@ -191,6 +191,7 @@ pub mod av1 {
         fn sv_pts(e: *mut c_void) -> i64;
         fn sv_keyframe(e: *mut c_void) -> c_int;
         fn sv_stats(e: *mut c_void, len: *mut usize) -> *const u8;
+        fn sv_sse(e: *mut c_void) -> f64;
         fn sv_close(e: *mut c_void);
     }
 
@@ -200,7 +201,9 @@ pub mod av1 {
         pub height: u32,
         pub fps_num: u32,
         pub fps_den: u32,
-        /// SVT-AV1 options as "key=value:key=value" (its CLI names).
+        /// SVT-AV1 options as "key=value:key=value" (its CLI names), plus
+        /// "measure=1" to have it report luma SSE (`Svt::sse`). With
+        /// "input-depth=10" it encodes 10-bit; frames are still sent as 8-bit.
         pub opts: String,
         /// 0 single pass, 1 first pass, 2 second pass.
         pub pass: u8,
@@ -225,6 +228,12 @@ pub mod av1 {
 
     impl Svt {
         pub fn open(cfg: &SvtConfig) -> Result<Self, String> {
+            // SVT-AV1 builds each encoder's block geometry through file-scope
+            // statics (utility.c), so encoders must not be created
+            // concurrently in one process (native lab runs; wasm workers
+            // each have their own instance).
+            static OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = OPEN.lock().unwrap_or_else(|e| e.into_inner());
             let opts = CString::new(cfg.opts.as_str()).unwrap();
             let raw = unsafe {
                 sv_open(cfg.width as c_int, cfg.height as c_int, cfg.fps_num as c_int, cfg.fps_den as c_int,
@@ -286,6 +295,12 @@ pub mod av1 {
                 }
             }
             Ok(std::mem::take(&mut self.out))
+        }
+
+        /// Luma SSE (8-bit units) summed over the frames output so far;
+        /// needs "measure=1" in the options.
+        pub fn sse(&self) -> f64 {
+            unsafe { sv_sse(self.raw) }
         }
 
         /// First-pass statistics (after `finish` on a pass-1 encoder).

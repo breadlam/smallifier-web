@@ -31,15 +31,42 @@ Settings:
   source rate up to 60. High rates are divided by an integer (60 → 30,
   59.94 → 29.97) so motion stays even.
 * **Audio**: Opus, by default 5% of the budget clamped to 24–96 kbps, as
-  smallifier.py.
-* **Video codec**: *H.264* plays on practically everything. *AV1* (SVT-AV1
-  preset 8, smallifier.py's tuning) looks far better at the same size —
-  +3.5 to +15 VMAF over x264 on our test clips — but takes about 2–4× as long and only
-  plays where AV1 decoding exists: current Chrome, Edge, Firefox, Android;
-  on Apple devices only those with an AV1 hardware decoder (iPhone 15 Pro,
-  M3 Macs and later).
-* **Encoder speed**: for H.264, *Balanced* (x264 `medium`) or *Fast* (x264
-  `veryfast`, about 3× quicker, slightly softer).
+  smallifier.py; 16 and 24 kbps can be chosen for very tight targets.
+* **Video codec**: *H.264* plays on practically everything. *AV1* (SVT-AV1,
+  smallifier.py's tuning) looks far better at the same size —
+  +3.5 to +15 VMAF over x264 on our test clips at the Balanced effort — but
+  takes longer and only plays where AV1 decoding exists: current Chrome,
+  Edge, Firefox, Android; on Apple devices only those with an AV1 hardware
+  decoder (iPhone 15 Pro, M3 Macs and later).
+* **Effort**: how long the encoder may spend for a given size. Each level is
+  its own encoder preset with its own fitted size/quality model, so slower
+  levels are planned just as accurately:
+
+  | | Effort | encoder preset | time | bitrate for equal quality |
+  |---|---|---|---|---|
+  | H.264 | Fast | x264 veryfast | 0.5× | +7% |
+  | | **Balanced** | x264 medium | 1× | — |
+  | | Slow | x264 slower | 3.2× | −7% |
+  | | Slowest | x264 veryslow | 5.1× | −13% |
+  | AV1 | **Balanced** | SVT-AV1 preset 8 | 1× (≈ 3.6× H.264 Balanced) | — |
+  | | Slow | preset 6 | 1.8× | −12% |
+  | | Slower | preset 5 | 2.4× | −19% |
+  | | Much slower | preset 4 | 3.1× | −24% |
+  | | Very slow | preset 3 | 4.8× | −30% |
+  | | Slowest | preset 2, as smallifier.py | 10.5× | −37% |
+
+  Slower levels matter most at aggressive targets: GTA V at the bitrate of
+  24 minutes in 20 MB scores VMAF 70.0 at AV1 Balanced and 76.6 at Slowest
+  (worst 5% of frames: 44.3 → 61.3); plain x264 scores 51. 10-bit AV1 was
+  measured too (smallifier.py used it) and isn't offered: under 1% smaller
+  for 15–45% more time.
+
+  The page shows a rough time estimate for the chosen file and settings
+  before you start, and the remaining time while it runs.
+* **Long runs** keep the screen awake while encoding, and are resumable:
+  finished chunks are stored in the browser's private storage, so if the tab
+  is closed or crashes, choosing the same file again restores the settings
+  and continues where it stopped.
 
 Browser notes: decoding uses WebCodecs (Firefox 130+, Chrome/Edge 94+,
 Safari 16.4+). Firefox on Linux decodes H.264 through the system's FFmpeg
@@ -95,9 +122,10 @@ Layout:
 * `crates/wasm` — the WebAssembly module's C-ABI entry points
 * `crates/lab` — native tools that make ground-truth encodes with the same x264 build, for fitting and checking the model
 * `web/` — the page, its worker, and a minimal WASI shim with an in-memory filesystem (for x264's two-pass stats)
-* `tools/` — model fitting (`fit_model.py`), allocation and resolution evaluation (`eval_alloc.py`, `eval_outres.py`),
-  VMAF calibration (`vmaf_map.py`), browser end-to-end tests (`browser_test.py`, Playwright) and
-  the VMAF comparison against plain two-pass (`compare_vmaf.py`)
+* `tools/` — model fitting (`fit_model.py`, `port_model.py`, `parity.py`), allocation and resolution evaluation
+  (`eval_alloc.py`, `eval_outres.py`), preset comparisons (`svt_survey.py`, `preset_gain.py`), wasm encoder speed
+  (`node_speed.mjs`), VMAF calibration (`vmaf_map.py`), browser end-to-end tests (`browser_test.py`, Playwright;
+  `--interrupt N` tests resuming) and the VMAF comparison against plain two-pass (`compare_vmaf.py`)
 
 The Python tools need `numpy` and `scipy` (`playwright` for the browser
 tests, an ffmpeg with libx264 and libvmaf for the comparisons).
@@ -109,9 +137,13 @@ cargo build -p smallifier-lab --release
 target/release/smallifier-lab gen CLIP.mp4 1280x720 30 target/lab/clip.json --verify --preset medium   # or svt8
 python3 tools/fit_model.py --save target/fit/medium.json target/lab/*.json
 python3 tools/port_model.py MEDIUM target/fit/medium.json     # writes crates/core/src/model.rs
-target/release/smallifier-lab parity target/lab/clip.json medium   # must match fit_model.py's predictions
+python3 tools/parity.py target/release/smallifier-lab target/fit/medium.json target/lab/clip.json medium   # Rust == Python
 python3 tools/eval_alloc.py target/fit/medium.json target/lab/*.json
 ```
+
+Every preset in the app needs such a fit (`model_for` in `crates/core/src/model.rs`). The slow SVT-AV1 presets
+(`svt6` … `svt2`) used a reduced design, `--rungs 0.6,1.0 --crfs 24,34,44,53,62` on five clip/size sets. Run lab
+processes with different SVT-AV1 presets side by side rather than in one process (`LAB_THREADS` caps each).
 
 ## Licence
 

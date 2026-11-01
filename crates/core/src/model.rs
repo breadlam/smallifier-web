@@ -106,9 +106,48 @@ pub const VERYFAST: Model = Model {
     chunk_sigma: 0.03,
 };
 
-/// SVT-AV1 preset number of an "svtN" preset name, if it is one.
-pub fn svt_preset(preset: &str) -> Option<u32> {
-    preset.strip_prefix("svt").and_then(|p| p.parse().ok())
+/// x264 slower and veryslow, fitted on the same lab design as medium. Their
+/// second passes overshoot short chunks like medium's, but ~3% less overall
+/// (browser runs), hence bias_base 1.0.
+pub const SLOWER: Model = Model {
+    rate: RateParams {
+        a_i: 5.1977192788568125, b_i: 3.661438452072924, c_i: 0.5107445601572048,
+        a_p: 3.6965730798542213, b_p: 0.0018737200472413148, c_p: 0.9301822929682398,
+        d_i: -3.189346337839274, d_p: 2.0753939283596115, tau: 0.6939812830822337, tau_hf: 1.3558463296914411, mv_p: 3.4479934569437103,
+    },
+    dist: DistParams { ln_a: -3.7082046313757595, b: 1.2286535645789538, g: 0.8775743273161757 },
+    q_double: 6.0,
+    crf_min: 12.0,
+    crf_max: 51.0,
+    bias_base: 1.0,
+    bias_per_frame: 1.5,
+    chunk_sigma: 0.03,
+};
+
+pub const VERYSLOW: Model = Model {
+    rate: RateParams {
+        a_i: 10.442815004923478, b_i: 4.264528516363398, c_i: 4.600494488921234,
+        a_p: 3.9878065049373523, b_p: 0.04623854872756038, c_p: 0.7989782947383715,
+        d_i: -4.5469630402224315, d_p: 1.9423834391685826, tau: 0.6970535202805725, tau_hf: 2.401434532615181, mv_p: 2.991036483833553,
+    },
+    dist: DistParams { ln_a: -3.839628391748531, b: 1.2182280326075368, g: 0.9239134169374331 },
+    q_double: 6.0,
+    crf_min: 12.0,
+    crf_max: 51.0,
+    bias_base: 1.0,
+    bias_per_frame: 1.5,
+    chunk_sigma: 0.03,
+};
+
+/// SVT-AV1 (preset, bit depth) of an AV1 preset name: "svtN" is preset N
+/// at 8 bits, "svtN-10" at 10 bits.
+pub fn svt_preset(preset: &str) -> Option<(u32, u32)> {
+    let rest = preset.strip_prefix("svt")?;
+    let (p, depth) = match rest.split_once('-') {
+        Some((p, d)) => (p, d.parse().ok()?),
+        None => (rest, 8),
+    };
+    Some((p.parse().ok()?, depth))
 }
 
 /// SVT-AV1 options (its CLI names; rate control added by the caller as
@@ -116,10 +155,10 @@ pub fn svt_preset(preset: &str) -> Option<u32> {
 /// matrices, aq-mode 2) minus overlays, which multi-pass doesn't allow;
 /// closed GOPs so chunks are independent; lp=1, which makes SVT-AV1 run its
 /// kernels cooperatively on one thread (the wasm build has no threads).
-pub fn svt_opts(preset: u32, rc: &str) -> String {
+pub fn svt_opts(preset: u32, depth: u32, rc: &str) -> String {
     format!(
-        "preset={preset}:{rc}:keyint=300:irefresh-type=2:tune=0:enable-tf=0:enable-qm=1:qm-min=0:qm-max=15:\
-         aq-mode=2:scd=1:enable-overlays=0:film-grain=0:lp=1"
+        "preset={preset}:input-depth={depth}:{rc}:keyint=300:irefresh-type=2:tune=0:enable-tf=0:enable-qm=1:\
+         qm-min=0:qm-max=15:aq-mode=2:scd=1:enable-overlays=0:film-grain=0:lp=1"
     )
 }
 
@@ -140,12 +179,106 @@ pub const SVT8: Model = Model {
     chunk_sigma: 0.02,
 };
 
-pub fn model_for(preset: &str) -> &'static Model {
-    match preset {
+/// SVT-AV1 preset 6: fitted on a reduced lab design (5 clip/size sets,
+/// rungs 0.6 and 1.0, 5 CRFs); two-pass lands within ~1% like preset 8.
+pub const SVT6: Model = Model {
+    rate: RateParams {
+        a_i: 6.901279650411129, b_i: 4.750835387084431, c_i: 0.2648118333932189,
+        a_p: 2.562145602023137, b_p: 0.22848346272740871, c_p: 0.522426452319615,
+        d_i: -6.5534244006583195, d_p: 3.2981708487453947, tau: 0.8942312601075101, tau_hf: 1.9636820580015808, mv_p: 0.5542621211146328,
+    },
+    dist: DistParams { ln_a: -3.5243489012835854, b: 0.9582802480158579, g: 1.0595992741347677 },
+    q_double: 10.948074497981313,
+    crf_min: 10.0,
+    crf_max: 63.0,
+    bias_base: 1.0,
+    bias_per_frame: 0.0,
+    chunk_sigma: 0.02,
+};
+
+/// SVT-AV1 preset 5: fitted on a reduced lab design (5 clip/size sets,
+/// rungs 0.6 and 1.0, 5 CRFs); two-pass lands within ~1% like preset 8.
+pub const SVT5: Model = Model {
+    rate: RateParams {
+        a_i: 10.72132607497544, b_i: 6.223601958841172, c_i: 2.06304032522098,
+        a_p: 2.8037179365937726, b_p: 0.02959635246831241, c_p: 1.0361385942975847,
+        d_i: -4.419828366448159, d_p: 3.8546146664602423, tau: 0.8564374146911404, tau_hf: 2.0596423463803153, mv_p: 1.0436675525739318,
+    },
+    dist: DistParams { ln_a: -3.8696168155277273, b: 0.8895715111032971, g: 1.1431596884120838 },
+    q_double: 10.405259193038736,
+    crf_min: 10.0,
+    crf_max: 63.0,
+    bias_base: 1.0,
+    bias_per_frame: 0.0,
+    chunk_sigma: 0.02,
+};
+
+/// SVT-AV1 preset 4: fitted on a reduced lab design (5 clip/size sets,
+/// rungs 0.6 and 1.0, 5 CRFs); two-pass lands within ~1% like preset 8.
+pub const SVT4: Model = Model {
+    rate: RateParams {
+        a_i: 7.447758375601836, b_i: 3.541635035590568, c_i: 0.43845037632641715,
+        a_p: 2.3859465400444737, b_p: 0.09976932010405787, c_p: 0.9503342829929615,
+        d_i: -5.2516092560915615, d_p: 4.159763905574993, tau: 0.8473000198279849, tau_hf: 1.7467205391454363, mv_p: 0.6497026462015939,
+    },
+    dist: DistParams { ln_a: -3.9360154323577587, b: 0.9171484326108035, g: 1.1575089598924413 },
+    q_double: 10.80599948925056,
+    crf_min: 10.0,
+    crf_max: 63.0,
+    bias_base: 1.0,
+    bias_per_frame: 0.0,
+    chunk_sigma: 0.02,
+};
+
+/// SVT-AV1 preset 3: fitted on a reduced lab design (5 clip/size sets,
+/// rungs 0.6 and 1.0, 5 CRFs); two-pass lands within ~1% like preset 8.
+pub const SVT3: Model = Model {
+    rate: RateParams {
+        a_i: 7.447224066029272, b_i: 3.541272495990696, c_i: 0.43843915057661054,
+        a_p: 2.372722622844683, b_p: 0.09917251122189369, c_p: 0.9479274880352149,
+        d_i: -5.251250626459328, d_p: 4.160319786875874, tau: 0.8481970143909792, tau_hf: 1.747309397187073, mv_p: 0.6493753370835833,
+    },
+    dist: DistParams { ln_a: -4.108094729801061, b: 0.9395554943115955, g: 1.1715194066491035 },
+    q_double: 10.80412692757622,
+    crf_min: 10.0,
+    crf_max: 63.0,
+    bias_base: 1.0,
+    bias_per_frame: 0.0,
+    chunk_sigma: 0.02,
+};
+
+/// SVT-AV1 preset 2: fitted on a reduced lab design (5 clip/size sets,
+/// rungs 0.6 and 1.0, 5 CRFs); two-pass lands within ~1% like preset 8.
+pub const SVT2: Model = Model {
+    rate: RateParams {
+        a_i: 5.815678122300166, b_i: 4.809428088730607, c_i: 0.1462127167871439,
+        a_p: 2.5436428483595406, b_p: 0.29271644672998953, c_p: 0.5425628631882208,
+        d_i: -10.550362573706025, d_p: 4.527123242194438, tau: 0.9101037123178956, tau_hf: 2.163526600378827, mv_p: 0.29464653519132816,
+    },
+    dist: DistParams { ln_a: -4.508723401538453, b: 1.0478303182135127, g: 1.1979096671661849 },
+    q_double: 11.08642675264924,
+    crf_min: 10.0,
+    crf_max: 63.0,
+    bias_base: 1.0,
+    bias_per_frame: 0.0,
+    chunk_sigma: 0.02,
+};
+
+/// The fitted model of a preset (each preset needs its own fit).
+pub fn model_for(preset: &str) -> Option<&'static Model> {
+    Some(match preset {
         "veryfast" => &VERYFAST,
+        "medium" => &MEDIUM,
+        "slower" => &SLOWER,
+        "veryslow" => &VERYSLOW,
         "svt8" => &SVT8,
-        _ => &MEDIUM,
-    }
+        "svt6" => &SVT6,
+        "svt5" => &SVT5,
+        "svt4" => &SVT4,
+        "svt3" => &SVT3,
+        "svt2" => &SVT2,
+        _ => return None,
+    })
 }
 
 /// Analysis aggregated over one chunk: its first frame coded as I, the

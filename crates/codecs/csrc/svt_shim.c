@@ -21,6 +21,12 @@ typedef struct {
     uint8_t *stats_in;
     uint8_t *stats_out;
     size_t stats_out_len;
+    int pass;
+    /* 10-bit encodes take 16-bit samples: 8-bit input is widened here. */
+    uint16_t *wide;
+    /* "measure=1": SVT-AV1 reports each frame's luma SSE (PSNR only, no SSIM). */
+    int measure;
+    uint64_t sse;
 } sv_enc;
 
 /* Only warnings and errors reach stderr (the JS console in the browser). */
@@ -57,6 +63,10 @@ sv_enc *sv_open(int w, int h, int fps_num, int fps_den, const char *opts, int pa
             char *eq = strchr(kv, '=');
             if (!eq) continue;
             *eq = 0;
+            if (!strcmp(kv, "measure")) {
+                e->measure = atoi(eq + 1);
+                continue;
+            }
             if (svt_av1_enc_parse_parameter(c, kv, eq + 1) != EB_ErrorNone) {
                 fprintf(stderr, "svt-av1: bad option %s=%s\n", kv, eq + 1);
                 free(s);
@@ -66,6 +76,12 @@ sv_enc *sv_open(int w, int h, int fps_num, int fps_den, const char *opts, int pa
         free(s);
     }
     c->pass = pass;
+    e->pass = pass;
+    if (c->encoder_bit_depth > 8) {
+        size_t cw = (size_t)(w + 1) / 2, ch = (size_t)(h + 1) / 2;
+        e->wide = malloc(((size_t)w * h + 2 * cw * ch) * sizeof(uint16_t));
+        if (!e->wide) goto fail;
+    }
     if (pass == 2) {
         e->stats_in = malloc(stats_len ? stats_len : 1);
         memcpy(e->stats_in, stats, stats_len);
@@ -84,6 +100,7 @@ sv_enc *sv_open(int w, int h, int fps_num, int fps_den, const char *opts, int pa
     return e;
 fail:
     if (e->h) svt_av1_enc_deinit_handle(e->h);
+    free(e->wide);
     free(e->stats_in);
     free(e);
     return NULL;
@@ -95,17 +112,37 @@ const uint8_t *sv_header(sv_enc *e, int *len) {
     return e->hdr;
 }
 
+static void widen(uint16_t *dst, const uint8_t *src, int stride, int w, int h) {
+    for (int r = 0; r < h; r++, src += stride, dst += w)
+        for (int i = 0; i < w; i++) dst[i] = (uint16_t)(src[i] << 2);
+}
+
 int sv_send(sv_enc *e, const uint8_t *y, const uint8_t *u, const uint8_t *v, int stride_y, int stride_c,
             int64_t pts) {
+    int cw = (e->width + 1) / 2, ch = (e->height + 1) / 2;
     EbSvtIOFormat io = {(uint8_t *)y, (uint8_t *)u, (uint8_t *)v, (uint32_t)stride_y, (uint32_t)stride_c,
                         (uint32_t)stride_c};
+    uint32_t filled = (uint32_t)(stride_y * e->height + 2 * stride_c * ch);
+    if (e->wide) {
+        /* Unpacked 16-bit samples, strides in samples. */
+        uint16_t *wy = e->wide, *wu = wy + (size_t)e->width * e->height, *wv = wu + (size_t)cw * ch;
+        widen(wy, y, stride_y, e->width, e->height);
+        widen(wu, u, stride_c, cw, ch);
+        widen(wv, v, stride_c, cw, ch);
+        io = (EbSvtIOFormat){(uint8_t *)wy, (uint8_t *)wu, (uint8_t *)wv, (uint32_t)e->width, (uint32_t)cw,
+                             (uint32_t)cw};
+        filled = (uint32_t)(((size_t)e->width * e->height + 2 * (size_t)cw * ch) * 2);
+    }
     EbBufferHeaderType in;
     memset(&in, 0, sizeof(in));
     in.size = sizeof(in);
     in.p_buffer = (uint8_t *)&io;
-    in.n_filled_len = (uint32_t)(stride_y * e->height + 2 * stride_c * ((e->height + 1) / 2));
+    in.n_filled_len = filled;
     in.pts = pts;
     in.pic_type = EB_AV1_INVALID_PICTURE;
+    SvtAv1ComputeQualityInfo q = {true, false};
+    EbPrivDataNode node = {COMPUTE_QUALITY_EVENT, &q, sizeof(q), NULL};
+    if (e->measure && e->pass != 1) in.p_app_private = &node;
     return svt_av1_enc_send_picture(e->h, &in) == EB_ErrorNone ? 0 : -1;
 }
 
@@ -142,12 +179,16 @@ int sv_receive(sv_enc *e, int block) {
     if (e->len) memcpy(e->buf, out->p_buffer, e->len);
     e->pts = out->pts;
     e->keyframe = out->pic_type == EB_AV1_KEY_PICTURE;
+    e->sse += out->luma_sse;
     svt_av1_enc_release_out_buffer(&out);
     if (e->len) return (int)e->len;
     return eos ? -2 : 0;
 }
 
 const uint8_t *sv_data(sv_enc *e) { return e->buf; }
+/* Luma SSE summed over the frames output so far, in 8-bit units (only
+ * with "measure=1"). */
+double sv_sse(sv_enc *e) { return (double)e->sse / (e->wide ? 16.0 : 1.0); }
 int64_t sv_pts(sv_enc *e) { return e->pts; }
 int sv_keyframe(sv_enc *e) { return e->keyframe; }
 
@@ -173,6 +214,7 @@ void sv_close(sv_enc *e) {
         svt_av1_enc_deinit_handle(e->h);
     }
     free(e->hdr);
+    free(e->wide);
     free(e->buf);
     free(e->stats_in);
     free(e->stats_out);

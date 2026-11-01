@@ -115,6 +115,8 @@ button:disabled { opacity: 0.5; cursor: default; }
 .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
 #bar { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
 #status { color: var(--muted); font-size: 0.9rem; min-height: 1.5em; }
+.estimate { color: var(--muted); font-size: 0.9rem; margin: 14px 0 10px; }
+.resume-note { margin: 14px 0 0; padding: 8px 12px; border-left: 3px solid var(--accent); font-size: 0.9rem; }
 
 video { width: 100%; max-height: 60vh; background: #000; border-radius: 6px; }
 

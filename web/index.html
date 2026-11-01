@@ -54,7 +54,9 @@
       </label>
       <label>Audio
         <select id="audio">
-          <option value="auto" selected>Auto (Opus, ~5% of the size)</option>
+          <option value="auto" selected>Auto (Opus, ~5% of the size, at least 24 kbps)</option>
+          <option value="16000">16 kbps (speech-grade; for very tight sizes)</option>
+          <option value="24000">24 kbps</option>
           <option value="32000">32 kbps</option>
           <option value="48000">48 kbps</option>
           <option value="64000">64 kbps</option>
@@ -70,15 +72,17 @@
         </select>
         <small id="codec-note"></small>
       </label>
-      <label>Encoder speed
+      <label>Effort
         <select id="preset"></select>
         <small id="preset-note"></small>
       </label>
       <label>Parallel workers
         <select id="workers"></select>
-        <small>Each worker needs roughly 150–350 MB of memory.</small>
+        <small>Each worker needs roughly 100–400 MB of memory, more at higher resolutions.</small>
       </label>
     </div>
+    <p id="resume-note" class="resume-note" hidden></p>
+    <p id="estimate" class="estimate"></p>
     <button id="go" type="button">Smallify</button>
   </section>
 
@@ -112,7 +116,7 @@
 <footer>
   <p>How it works: one cheap analysis pass predicts, for every scene, how large and how good the encode would be at each
   resolution and quality setting. The budget is spent where it buys the most quality, then each chunk is encoded once
-  with two-pass x264 to land on its share. Output is H.264 + Opus in MP4, which plays almost everywhere.</p>
+  with two-pass x264 or SVT-AV1 to land on its share. Output is H.264 (plays almost everywhere) or AV1, with Opus, in MP4.</p>
   <p>x264 (GPL), SVT-AV1 and libopus are compiled to WebAssembly; decoding uses your browser's WebCodecs.</p>
 </footer>
 
