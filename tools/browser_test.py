@@ -47,12 +47,13 @@ def main():
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--dump", default=None, help="A:B — save decoded luma of output frames A..B (diagnostics) and exit")
     ap.add_argument("--raw", action="store_true", help="with --dump: luma straight from VideoFrame.copyTo, no wasm")
+    ap.add_argument("--url", default=None, help="test this deployed page instead of a local server for web/")
     ap.add_argument("--interrupt", type=int, default=0,
                     help="cancel once this many chunks are encoded, then start again (tests resuming)")
     args = ap.parse_args()
 
     srv = serve()
-    url = f"http://127.0.0.1:{srv.server_address[1]}/index.html"
+    url = args.url or f"http://127.0.0.1:{srv.server_address[1]}/index.html"
     with sync_playwright() as p:
         browser = getattr(p, args.browser).launch()
         page = browser.new_page()
